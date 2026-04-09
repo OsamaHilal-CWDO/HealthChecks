@@ -6,6 +6,7 @@ import json
 import re
 import shutil
 import subprocess
+import sys
 from collections import Counter
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -20,6 +21,11 @@ IP_RE = re.compile(r'^(\S+)\s')
 
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def progress_log(enabled: bool, message: str):
+    if enabled:
+        print(f"[{now_utc_iso()}] {message}", file=sys.stderr, flush=True)
 
 
 def iter_log_lines(path: Path):
@@ -440,7 +446,7 @@ def collect_apps(roots):
     return apps
 
 
-def summarize_app(app: str, app_dir: Path, log_files, geo: GeoResolver):
+def summarize_app(app: str, app_dir: Path, log_files, geo: GeoResolver, progress: bool = False):
     total = 0
     ip_hits = Counter()
     countries = Counter()
@@ -449,11 +455,14 @@ def summarize_app(app: str, app_dir: Path, log_files, geo: GeoResolver):
     statuses = Counter()
     ua_non_browser = Counter()
 
-    for lf in log_files:
+    progress_log(progress, f"[{app}] parsing {len(log_files)} log files")
+    for idx, lf in enumerate(log_files, start=1):
+        file_lines = 0
         for line in iter_log_lines(lf):
             if not line.strip():
                 continue
             total += 1
+            file_lines += 1
             ip, endpoint, status, ua = parse_log_line(line)
 
             endpoints[endpoint] += 1
@@ -466,16 +475,24 @@ def summarize_app(app: str, app_dir: Path, log_files, geo: GeoResolver):
                 and not any(marker in ua_l for marker in BROWSER_UA_MARKERS)
             ):
                 ua_non_browser[ua] += 1
+        progress_log(progress, f"[{app}] parsed file {idx}/{len(log_files)}: {lf.name} ({file_lines} lines)")
 
     # Batch ASN lookups for CLI backend to avoid one whois call per unique IP.
+    progress_log(progress, f"[{app}] collected {len(ip_hits)} unique IPs from {total} requests")
     geo.prewarm_asn(tuple(ip_hits.keys()))
+    progress_log(progress, f"[{app}] ASN prewarm completed")
+    processed_ips = 0
     for ip, cnt in ip_hits.items():
         cc, asn = geo.lookup(ip)
         countries[cc] += cnt
         asns[asn] += cnt
+        processed_ips += 1
+        if progress and processed_ips % 1000 == 0:
+            progress_log(progress, f"[{app}] geo-enriched {processed_ips}/{len(ip_hits)} unique IPs")
 
     error_count = sum(v for k, v in statuses.items() if k.isdigit() and (k.startswith("4") or k.startswith("5")))
     error_rate = (error_count / total * 100.0) if total else 0.0
+    progress_log(progress, f"[{app}] summary complete (error_rate={round(error_rate, 2)}%)")
 
     return {
         "app": app,
@@ -577,6 +594,11 @@ def main():
     parser.add_argument("--output-txt", default="/tmp/top5_backend_traffic_summary.txt")
     parser.add_argument("--skip-health", action="store_true")
     parser.add_argument(
+        "--progress",
+        action="store_true",
+        help="Print progress updates to stderr",
+    )
+    parser.add_argument(
         "--disable-whois-asn",
         action="store_true",
         help="Disable whois ASN resolution to speed up analysis",
@@ -587,6 +609,8 @@ def main():
     parser.add_argument("--countryv6-dat", default="")
     args = parser.parse_args()
 
+    progress = args.progress
+    progress_log(progress, "Starting backend access log analysis")
     roots = detect_roots(Path(args.applications_root))
     if not roots:
         payload = {
@@ -605,6 +629,7 @@ def main():
         print(Path(args.output_txt).read_text(encoding="utf-8"))
         return 1
 
+    progress_log(progress, f"Discovered {len(roots)} applications roots")
     apps = collect_apps(roots)
     if not apps:
         payload = {
@@ -644,9 +669,11 @@ def main():
         "/var/lib/GeoIP/GeoIPv6.dat",
     ])
 
+    progress_log(progress, f"Found {len(apps)} applications with backend logs")
     # First pass: rank all apps by total request count only (fast).
+    progress_log(progress, "Pass 1/2: ranking all applications by request count")
     ranked_apps = []
-    for app, data in apps.items():
+    for idx, (app, data) in enumerate(apps.items(), start=1):
         total = count_requests(data["log_files"])
         ranked_apps.append(
             {
@@ -656,10 +683,13 @@ def main():
                 "total_requests": total,
             }
         )
+        progress_log(progress, f"[rank {idx}/{len(apps)}] {app}: {total} requests")
     ranked_apps.sort(key=lambda x: x["total_requests"], reverse=True)
     top5_candidates = ranked_apps[:5]
+    progress_log(progress, "Top 5 by traffic: " + ", ".join(x["app"] for x in top5_candidates))
 
     # Second pass: full enrichment only for top 5 apps.
+    progress_log(progress, "Pass 2/2: enriching top 5 applications")
     geo = GeoResolver(
         country_db,
         asn_db,
@@ -667,19 +697,24 @@ def main():
         countryv6_dat,
         enable_whois_asn=not args.disable_whois_asn,
     )
+    progress_log(progress, f"Geo backend selected: {geo.backend} (whois_asn_enabled={not args.disable_whois_asn})")
     top5 = []
-    for row in top5_candidates:
+    for idx, row in enumerate(top5_candidates, start=1):
+        progress_log(progress, f"[top {idx}/{len(top5_candidates)}] processing {row['app']}")
         top5.append(
             summarize_app(
                 row["app"],
                 Path(row["app_dir"]),
                 row["log_files"],
                 geo,
+                progress=progress,
             )
         )
     geo.close()
+    progress_log(progress, "Top 5 enrichment complete")
 
     if not args.skip_health:
+        progress_log(progress, "Starting health checks for top 5 applications")
         for row in top5:
             app_dir = Path(row["app_dir"])
             domain = parse_server_name(app_dir / "conf" / "server.nginx")
@@ -687,12 +722,18 @@ def main():
                 domain = fallback_domain_from_wp(app_dir / "public_html")
             row["domain"] = domain
             if domain and (app_dir / "public_html").exists():
+                progress_log(progress, f"[health] running for {row['app']} ({domain})")
                 row["health_check"] = run_health_script(app_dir / "public_html", domain)
+                progress_log(
+                    progress,
+                    f"[health] {row['app']} exit={row['health_check'].get('exit_code', 'N/A')}",
+                )
             else:
                 row["health_check"] = {
                     "exit_code": -1,
                     "error": "Could not determine domain or public_html missing",
                 }
+                progress_log(progress, f"[health] skipped for {row['app']} (missing domain/public_html)")
 
     payload = {
         "generated_at": now_utc_iso(),
@@ -716,6 +757,7 @@ def main():
     report_txt = render_report(top5, ranked_apps, roots, geo.backend, args.output_json)
     Path(args.output_txt).write_text(report_txt, encoding="utf-8")
 
+    progress_log(progress, f"Wrote outputs: {args.output_json} and {args.output_txt}")
     print(report_txt)
     return 0
 

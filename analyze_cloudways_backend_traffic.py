@@ -80,6 +80,8 @@ class GeoResolver:
         self.enable_whois_asn = enable_whois_asn
         self.enabled = False
         self.backend = "none"
+        self._country_cache = {}
+        self._asn_cache = {}
 
         try:
             import geoip2.database  # type: ignore
@@ -190,6 +192,57 @@ class GeoResolver:
             pass
         return "UNKNOWN"
 
+    def _bulk_lookup_asn_whois(self, ips):
+        """
+        Resolve ASN for many IPs in fewer whois calls.
+        Uses Team Cymru bulk mode and caches all queried IPs.
+        """
+        if not self.whois_cmd or not self.enable_whois_asn:
+            return
+
+        to_query = [ip for ip in ips if ip not in self._asn_cache]
+        if not to_query:
+            return
+
+        chunk_size = 300
+        for i in range(0, len(to_query), chunk_size):
+            chunk = to_query[i : i + chunk_size]
+            payload = "begin\nverbose\n" + "\n".join(chunk) + "\nend\n"
+            resolved = {}
+
+            try:
+                proc = subprocess.run(
+                    [self.whois_cmd, "-h", "whois.cymru.com"],
+                    input=payload,
+                    capture_output=True,
+                    text=True,
+                    timeout=25,
+                    check=False,
+                )
+                out = f"{proc.stdout}\n{proc.stderr}"
+                for line in out.splitlines():
+                    if "|" not in line:
+                        continue
+                    parts = [p.strip() for p in line.split("|")]
+                    if len(parts) < 2:
+                        continue
+                    asn_num = parts[0]
+                    ip_val = parts[1]
+                    if not asn_num.isdigit():
+                        continue
+                    if ip_val:
+                        resolved[ip_val] = f"AS{asn_num}"
+            except Exception:
+                pass
+
+            # Ensure every queried IP gets cached to avoid repeated slow fallbacks.
+            for ip in chunk:
+                self._asn_cache[ip] = resolved.get(ip, "UNKNOWN")
+
+    def prewarm_asn(self, ips):
+        if self.backend in ("cli-geoip", "cli-whois-only"):
+            self._bulk_lookup_asn_whois(ips)
+
     @lru_cache(maxsize=200000)
     def lookup(self, ip: str):
         country = "UNKNOWN"
@@ -231,8 +284,17 @@ class GeoResolver:
             except Exception:
                 pass
         elif self.backend in ("cli-geoip", "cli-whois-only"):
-            country = self._lookup_country_cli(ip)
-            asn = self._lookup_asn_whois(ip)
+            if ip in self._country_cache:
+                country = self._country_cache[ip]
+            else:
+                country = self._lookup_country_cli(ip)
+                self._country_cache[ip] = country
+
+            if ip in self._asn_cache:
+                asn = self._asn_cache[ip]
+            else:
+                asn = self._lookup_asn_whois(ip)
+                self._asn_cache[ip] = asn
 
         return country, asn
 
@@ -380,6 +442,7 @@ def collect_apps(roots):
 
 def summarize_app(app: str, app_dir: Path, log_files, geo: GeoResolver):
     total = 0
+    ip_hits = Counter()
     countries = Counter()
     asns = Counter()
     endpoints = Counter()
@@ -395,10 +458,7 @@ def summarize_app(app: str, app_dir: Path, log_files, geo: GeoResolver):
 
             endpoints[endpoint] += 1
             statuses[status] += 1
-
-            cc, asn = geo.lookup(ip)
-            countries[cc] += 1
-            asns[asn] += 1
+            ip_hits[ip] += 1
 
             ua_l = ua.lower()
             if (
@@ -406,6 +466,13 @@ def summarize_app(app: str, app_dir: Path, log_files, geo: GeoResolver):
                 and not any(marker in ua_l for marker in BROWSER_UA_MARKERS)
             ):
                 ua_non_browser[ua] += 1
+
+    # Batch ASN lookups for CLI backend to avoid one whois call per unique IP.
+    geo.prewarm_asn(tuple(ip_hits.keys()))
+    for ip, cnt in ip_hits.items():
+        cc, asn = geo.lookup(ip)
+        countries[cc] += cnt
+        asns[asn] += cnt
 
     error_count = sum(v for k, v in statuses.items() if k.isdigit() and (k.startswith("4") or k.startswith("5")))
     error_rate = (error_count / total * 100.0) if total else 0.0
@@ -422,6 +489,15 @@ def summarize_app(app: str, app_dir: Path, log_files, geo: GeoResolver):
         "error_count": error_count,
         "error_rate_percent": round(error_rate, 2),
     }
+
+
+def count_requests(log_files):
+    total = 0
+    for lf in log_files:
+        for line in iter_log_lines(lf):
+            if line.strip():
+                total += 1
+    return total
 
 
 def render_report(top5, all_sorted, roots, geo_backend, out_json_path):
@@ -500,6 +576,11 @@ def main():
     parser.add_argument("--output-json", default="/tmp/top5_backend_traffic_summary.json")
     parser.add_argument("--output-txt", default="/tmp/top5_backend_traffic_summary.txt")
     parser.add_argument("--skip-health", action="store_true")
+    parser.add_argument(
+        "--disable-whois-asn",
+        action="store_true",
+        help="Disable whois ASN resolution to speed up analysis",
+    )
     parser.add_argument("--country-mmdb", default="")
     parser.add_argument("--asn-mmdb", default="")
     parser.add_argument("--country-dat", default="")
@@ -563,16 +644,40 @@ def main():
         "/var/lib/GeoIP/GeoIPv6.dat",
     ])
 
-    geo = GeoResolver(country_db, asn_db, country_dat, countryv6_dat)
-
-    summaries = []
+    # First pass: rank all apps by total request count only (fast).
+    ranked_apps = []
     for app, data in apps.items():
-        summaries.append(summarize_app(app, data["app_dir"], data["log_files"], geo))
+        total = count_requests(data["log_files"])
+        ranked_apps.append(
+            {
+                "app": app,
+                "app_dir": str(data["app_dir"]),
+                "log_files": data["log_files"],
+                "total_requests": total,
+            }
+        )
+    ranked_apps.sort(key=lambda x: x["total_requests"], reverse=True)
+    top5_candidates = ranked_apps[:5]
 
+    # Second pass: full enrichment only for top 5 apps.
+    geo = GeoResolver(
+        country_db,
+        asn_db,
+        country_dat,
+        countryv6_dat,
+        enable_whois_asn=not args.disable_whois_asn,
+    )
+    top5 = []
+    for row in top5_candidates:
+        top5.append(
+            summarize_app(
+                row["app"],
+                Path(row["app_dir"]),
+                row["log_files"],
+                geo,
+            )
+        )
     geo.close()
-
-    sorted_apps = sorted(summaries, key=lambda x: x["total_requests"], reverse=True)
-    top5 = sorted_apps[:5]
 
     if not args.skip_health:
         for row in top5:
@@ -594,20 +699,21 @@ def main():
         "roots_scanned": [str(x) for x in roots],
         "geoip_enabled": geo.enabled,
         "geoip_backend": geo.backend,
+        "whois_asn_enabled": not args.disable_whois_asn,
         "geoip_country_db": str(country_db) if country_db else "",
         "geoip_asn_db": str(asn_db) if asn_db else "",
         "geoip_country_dat": str(country_dat) if country_dat else "",
         "geoip_countryv6_dat": str(countryv6_dat) if countryv6_dat else "",
-        "total_applications_found": len(sorted_apps),
+        "total_applications_found": len(ranked_apps),
         "top5": top5,
         "all_applications_sorted": [
             {"app": x["app"], "total_requests": x["total_requests"], "app_dir": x["app_dir"]}
-            for x in sorted_apps
+            for x in ranked_apps
         ],
     }
 
     Path(args.output_json).write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    report_txt = render_report(top5, sorted_apps, roots, geo.backend, args.output_json)
+    report_txt = render_report(top5, ranked_apps, roots, geo.backend, args.output_json)
     Path(args.output_txt).write_text(report_txt, encoding="utf-8")
 
     print(report_txt)

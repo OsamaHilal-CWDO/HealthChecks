@@ -14,6 +14,7 @@ BROWSER_UA_MARKERS = ("mozilla", "chrome", "chromium", "safari")
 REQUEST_RE = re.compile(r'"([A-Z]+)\s+([^\s"]+)\s+HTTP/[0-9.]+"')
 STATUS_RE = re.compile(r'"\s+(\d{3})\s+')
 IP_RE = re.compile(r'^(\S+)\s')
+BACKEND_LOG_DAY_RE = re.compile(r"\.access\.log(?:\.(\d+)(?:\.gz)?)?$")
 
 
 def now_utc_iso() -> str:
@@ -187,11 +188,38 @@ def collect_apps(roots):
             logs = app_dir / "logs"
             if not logs.is_dir():
                 continue
-            files = sorted(logs.glob("backend*.access.log*"))
+            files = sorted(logs.glob("backend*.access.log*"), key=backend_log_day_index)
             files = [f for f in files if f.is_file()]
             if files:
                 apps[app_dir.name] = {"app_dir": app_dir, "log_files": files}
     return apps
+
+
+def backend_log_day_index(path: Path) -> int:
+    """
+    Map rotated backend logs to day slots:
+      backend*.access.log      -> 1 day
+      backend*.access.log.1    -> 2 days
+      backend*.access.log.2.gz -> 3 days
+      ...
+    """
+    m = BACKEND_LOG_DAY_RE.search(path.name)
+    if not m:
+        return 999999
+    idx = m.group(1)
+    if idx is None:
+        return 1
+    try:
+        return int(idx) + 1
+    except ValueError:
+        return 999999
+
+
+def select_log_files_by_days(log_files, days: int | None):
+    ordered = sorted(log_files, key=backend_log_day_index)
+    if days is None:
+        return ordered
+    return [lf for lf in ordered if backend_log_day_index(lf) <= days]
 
 
 def count_requests(log_files):
@@ -209,6 +237,7 @@ def summarize_app_no_geo(app: str, app_dir: Path, log_files, progress: bool = Fa
     statuses = Counter()
     ua_non_browser = Counter()
     unique_ips = set()
+    daily_stats = []
 
     log_progress(progress, f"[{app}] parsing {len(log_files)} log files")
     for idx, lf in enumerate(log_files, 1):
@@ -230,6 +259,15 @@ def summarize_app_no_geo(app: str, app_dir: Path, log_files, progress: bool = Fa
                 and not any(marker in ua_l for marker in BROWSER_UA_MARKERS)
             ):
                 ua_non_browser[ua] += 1
+        day_num = backend_log_day_index(lf)
+        daily_stats.append(
+            {
+                "day_number": day_num,
+                "file_name": lf.name,
+                "requests": line_count,
+                "avg_requests_per_minute": round(line_count / 1440.0, 4),
+            }
+        )
         log_progress(progress, f"[{app}] parsed file {idx}/{len(log_files)}: {lf.name} ({line_count} lines)")
 
     error_count = sum(v for k, v in statuses.items() if k.isdigit() and (k.startswith("4") or k.startswith("5")))
@@ -246,6 +284,7 @@ def summarize_app_no_geo(app: str, app_dir: Path, log_files, progress: bool = Fa
         "status_breakdown": sorted(statuses.items(), key=lambda x: x[0]),
         "error_count": error_count,
         "error_rate_percent": round(error_rate, 2),
+        "daily_request_stats": sorted(daily_stats, key=lambda x: x["day_number"]),
     }
 
 
@@ -270,6 +309,12 @@ def render_report(top5, all_sorted, roots, out_json_path):
         out.append(f"Unique IP Count: {row['unique_ip_count']}")
         out.append(f"Error Count (4xx+5xx): {row['error_count']}")
         out.append(f"Error Rate: {row['error_rate_percent']}%")
+        out.append("\nDaily Requests & Avg Requests/Minute:")
+        for d in row.get("daily_request_stats", []):
+            out.append(
+                f"  - Day {d['day_number']} ({d['file_name']}): "
+                f"{d['requests']} requests, avg/min {d['avg_requests_per_minute']}"
+            )
 
         out.append("\nTop Endpoints:")
         for k, v in row["top_endpoints"]:
@@ -311,7 +356,27 @@ def main():
     parser.add_argument("--output-txt", default="/tmp/top5_backend_traffic_nogeo_summary.txt")
     parser.add_argument("--skip-health", action="store_true")
     parser.add_argument("--progress", action="store_true", help="Print progress updates to stderr")
+    day_group = parser.add_mutually_exclusive_group()
+    day_group.add_argument(
+        "--days",
+        type=int,
+        default=None,
+        help=(
+            "Limit to N day-slots of rotated logs per app "
+            "(1=access.log, 2=access.log+access.log.1, 3=...+access.log.2.gz, etc)"
+        ),
+    )
+    day_group.add_argument(
+        "--all-days",
+        action="store_true",
+        help="Use all available rotated logs (default behavior)",
+    )
     args = parser.parse_args()
+
+    if args.days is not None and args.days < 1:
+        parser.error("--days must be >= 1")
+    if args.all_days:
+        args.days = None
 
     log_progress(args.progress, "Starting backend no-geo analysis")
     roots = detect_roots(Path(args.applications_root))
@@ -355,16 +420,39 @@ def main():
     ranked_apps = []
     log_progress(args.progress, "Pass 1/2: ranking all applications by request count")
     for idx, (app, data) in enumerate(apps.items(), 1):
-        total = count_requests(data["log_files"])
+        selected_logs = select_log_files_by_days(data["log_files"], args.days)
+        if not selected_logs:
+            log_progress(args.progress, f"[rank {idx}/{len(apps)}] {app}: skipped (no logs in selected day window)")
+            continue
+        total = count_requests(selected_logs)
         ranked_apps.append(
             {
                 "app": app,
                 "app_dir": str(data["app_dir"]),
-                "log_files": data["log_files"],
+                "log_files": selected_logs,
                 "total_requests": total,
             }
         )
-        log_progress(args.progress, f"[rank {idx}/{len(apps)}] {app}: {total} requests")
+        log_progress(
+            args.progress,
+            f"[rank {idx}/{len(apps)}] {app}: {total} requests across {len(selected_logs)} log files",
+        )
+
+    if not ranked_apps:
+        payload = {
+            "generated_at": now_utc_iso(),
+            "error": "No backend access logs matched selected day window",
+            "days_filter": args.days if args.days is not None else "all",
+            "roots": [str(x) for x in roots],
+        }
+        Path(args.output_json).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        Path(args.output_txt).write_text(
+            "No backend access logs matched selected day window.\n"
+            f"Days filter: {args.days if args.days is not None else 'all'}\n",
+            encoding="utf-8",
+        )
+        print(Path(args.output_txt).read_text(encoding="utf-8"))
+        return 1
 
     ranked_apps.sort(key=lambda x: x["total_requests"], reverse=True)
     top5_candidates = ranked_apps[:5]
@@ -408,6 +496,7 @@ def main():
         "geoip_enabled": False,
         "geoip_backend": "disabled",
         "whois_asn_enabled": False,
+        "days_filter": args.days if args.days is not None else "all",
         "total_applications_found": len(ranked_apps),
         "top5": top5,
         "all_applications_sorted": [

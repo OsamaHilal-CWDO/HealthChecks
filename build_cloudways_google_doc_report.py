@@ -144,18 +144,20 @@ def parse_health_json(path: str) -> dict:
     }
 
 
-def collect_health_records() -> List[dict]:
+def collect_health_records(source_mode: str = "merge") -> List[dict]:
     records: List[dict] = []
-    for p in sorted(glob.glob("/tmp/wp_health_runs/*.log")):
-        try:
-            records.append(parse_health_log(p))
-        except Exception:
-            continue
-    for p in sorted(glob.glob("/tmp/wp_health_report_*.json")):
-        try:
-            records.append(parse_health_json(p))
-        except Exception:
-            continue
+    if source_mode in ("merge", "log"):
+        for p in sorted(glob.glob("/tmp/wp_health_runs/*.log")):
+            try:
+                records.append(parse_health_log(p))
+            except Exception:
+                continue
+    if source_mode in ("merge", "json"):
+        for p in sorted(glob.glob("/tmp/wp_health_report_*.json")):
+            try:
+                records.append(parse_health_json(p))
+            except Exception:
+                continue
     return records
 
 
@@ -224,7 +226,7 @@ def merge_health(primary: dict, secondary: dict) -> dict:
     return merged
 
 
-def map_health_to_apps(top5: List[dict], records: List[dict]) -> Dict[str, dict]:
+def map_health_to_apps(top5: List[dict], records: List[dict], source_mode: str = "log") -> Dict[str, dict]:
     by_app: Dict[str, dict] = {}
 
     # Pre-index by normalized site domain
@@ -239,21 +241,23 @@ def map_health_to_apps(top5: List[dict], records: List[dict]) -> Dict[str, dict]
         domain = normalize_domain(app.get("domain", ""))
         candidates = []
 
-        # 1) direct app log has highest trust
-        direct = f"/tmp/wp_health_runs/{name}.log"
-        if Path(direct).exists():
-            try:
-                direct_rec = parse_health_log(direct)
-                candidates.append(direct_rec)
-                # If log references JSON report, merge it as enrichment.
-                report_json = direct_rec.get("report_json_path", "")
-                if report_json and Path(report_json).exists():
-                    try:
-                        candidates.append(parse_health_json(report_json))
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+        # 1) direct app log has highest trust when log source is enabled.
+        if source_mode in ("merge", "log"):
+            direct = f"/tmp/wp_health_runs/{name}.log"
+            if Path(direct).exists():
+                try:
+                    direct_rec = parse_health_log(direct)
+                    candidates.append(direct_rec)
+                    # Only merge linked JSON when explicitly in merge mode.
+                    if source_mode == "merge":
+                        report_json = direct_rec.get("report_json_path", "")
+                        if report_json and Path(report_json).exists():
+                            try:
+                                candidates.append(parse_health_json(report_json))
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
 
         # 2) domain match candidates
         if domain and domain in rec_by_domain:
@@ -263,8 +267,10 @@ def map_health_to_apps(top5: List[dict], records: List[dict]) -> Dict[str, dict]
         if candidates:
             candidates = sorted(candidates, key=health_score, reverse=True)
             chosen = candidates[0]
-            for extra in candidates[1:]:
-                chosen = merge_health(chosen, extra)
+            # For single-source modes, keep one best record only.
+            if source_mode == "merge":
+                for extra in candidates[1:]:
+                    chosen = merge_health(chosen, extra)
 
         # 3) fallback empty
         if not chosen:
@@ -491,14 +497,20 @@ def main():
     parser.add_argument("--output-html", default="/tmp/cloudways_consolidated_report.html")
     parser.add_argument("--output-csv", default="/tmp/cloudways_observation_notes_template.csv")
     parser.add_argument("--output-reference-csv", default="/tmp/cloudways_reference_tables.csv")
+    parser.add_argument(
+        "--health-source",
+        choices=["log", "json", "merge"],
+        default="log",
+        help="Choose health source: log only, json only, or merge both",
+    )
     args = parser.parse_args()
 
     traffic_path = choose_traffic_json(args.traffic_json or None)
     traffic = read_json(traffic_path)
     top5 = traffic.get("top5", [])
 
-    health_records = collect_health_records()
-    health_by_app = map_health_to_apps(top5, health_records)
+    health_records = collect_health_records(args.health_source)
+    health_by_app = map_health_to_apps(top5, health_records, args.health_source)
 
     build_report_html(traffic, health_by_app, args.output_html)
     build_notes_csv(top5, args.output_csv)
@@ -509,6 +521,7 @@ def main():
     print(args.output_csv)
     print(args.output_reference_csv)
     print(f"Traffic source: {traffic_path}")
+    print(f"Health source mode: {args.health_source}")
     print(f"Health records discovered: {len(health_records)}")
 
 

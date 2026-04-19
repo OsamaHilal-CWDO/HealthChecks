@@ -397,23 +397,40 @@ def run_health_script(public_html: Path, domain: str) -> dict:
         return {"exit_code": -1, "error": str(e), "log_file": str(log_file)}
 
 
-def detect_roots(requested_root: Path):
+def safe_is_dir(path: Path) -> bool:
+    try:
+        return path.is_dir()
+    except (PermissionError, OSError):
+        return False
+
+
+def detect_roots(requested_root: Path, strict_root: bool = False):
     def root_has_apps(root: Path) -> bool:
-        if not root.exists() or not root.is_dir():
+        if not root.exists() or not safe_is_dir(root):
             return False
-        for child in root.iterdir():
-            if child.is_dir() and (child / "logs").is_dir() and (child / "public_html").is_dir():
+        try:
+            children = list(root.iterdir())
+        except (PermissionError, OSError):
+            return False
+        for child in children:
+            if safe_is_dir(child) and safe_is_dir(child / "logs") and safe_is_dir(child / "public_html"):
                 return True
         return False
 
     roots = []
     if root_has_apps(requested_root):
         roots.append(requested_root)
+    if strict_root:
+        return roots
 
     home = Path("/home")
     if home.exists():
-        for item in home.iterdir():
-            if not item.is_dir():
+        try:
+            items = list(home.iterdir())
+        except (PermissionError, OSError):
+            items = []
+        for item in items:
+            if not safe_is_dir(item):
                 continue
             # /home/<id>.cloudwaysapps.com/<app>
             if root_has_apps(item):
@@ -654,6 +671,11 @@ def main():
     parser.add_argument("--asn-mmdb", default="")
     parser.add_argument("--country-dat", default="")
     parser.add_argument("--countryv6-dat", default="")
+    parser.add_argument(
+        "--strict-root",
+        action="store_true",
+        help="Scan only --applications-root and do not auto-discover other /home roots",
+    )
     day_group = parser.add_mutually_exclusive_group()
     day_group.add_argument(
         "--days",
@@ -677,7 +699,7 @@ def main():
 
     progress = args.progress
     progress_log(progress, "Starting backend access log analysis")
-    roots = detect_roots(Path(args.applications_root))
+    roots = detect_roots(Path(args.applications_root), strict_root=args.strict_root)
     if not roots:
         payload = {
             "generated_at": now_utc_iso(),

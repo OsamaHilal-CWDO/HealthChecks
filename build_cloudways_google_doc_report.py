@@ -14,6 +14,58 @@ from typing import Dict, List, Tuple
 from urllib.parse import urlparse
 
 
+def flatten_nested_metrics(prefix: str, value) -> List[Tuple[str, str]]:
+    rows: List[Tuple[str, str]] = []
+    if isinstance(value, dict):
+        for k, v in value.items():
+            child_prefix = f"{prefix}.{k}" if prefix else str(k)
+            rows.extend(flatten_nested_metrics(child_prefix, v))
+    elif isinstance(value, list):
+        for idx, item in enumerate(value, 1):
+            child_prefix = f"{prefix}[{idx}]"
+            rows.extend(flatten_nested_metrics(child_prefix, item))
+    else:
+        rows.append((prefix, str(value)))
+    return rows
+
+
+def parse_slow_plugins(value) -> List[List[str]]:
+    items: List[List[str]] = []
+    if not isinstance(value, list):
+        return items
+    for row in value:
+        if not isinstance(row, dict):
+            continue
+        plugin = str(row.get("plugin", "UNKNOWN"))
+        count = row.get("count", "N/A")
+        items.append([plugin, str(count)])
+    return items
+
+
+def parse_autoload_options(value) -> List[List[str]]:
+    items: List[List[str]] = []
+    if not isinstance(value, list):
+        return items
+    for row in value:
+        if isinstance(row, dict):
+            # Support multiple possible key names for option data.
+            name = (
+                row.get("option")
+                or row.get("name")
+                or row.get("option_name")
+                or row.get("key")
+                or "UNKNOWN"
+            )
+            details = []
+            for k in ("size_kb", "size_mb", "bytes", "value_size"):
+                if k in row:
+                    details.append(f"{k}={row[k]}")
+            items.append([str(name), ", ".join(details) if details else ""])
+        else:
+            items.append([str(row), ""])
+    return items
+
+
 def choose_traffic_json(explicit_path: str | None) -> str:
     if explicit_path and Path(explicit_path).exists():
         return explicit_path
@@ -72,6 +124,12 @@ def parse_health_log(path: str) -> dict:
         "report_json_path": report_json,
         "critical_issues": critical,
         "warnings": warnings,
+        "autoload_status": "N/A",
+        "autoload_size_kb": "N/A",
+        "autoload_size_mb": "N/A",
+        "autoload_top_options": [],
+        "cleanup_metrics": [],
+        "slow_plugins": [],
     }
 
 
@@ -125,6 +183,11 @@ def parse_health_json(path: str) -> dict:
     report_generated = data.get("report_generated") or data.get("generated_at") or "N/A"
     critical = deep_collect_list(data, ["critical_issues", "critical"])
     warnings = deep_collect_list(data, ["warnings", "warning"])
+    backend = data.get("backend", {}) if isinstance(data.get("backend"), dict) else {}
+    autoload = backend.get("autoload", {}) if isinstance(backend.get("autoload"), dict) else {}
+    cleanup = backend.get("cleanup", {}) if isinstance(backend.get("cleanup"), dict) else {}
+    slow_logs = data.get("slow_logs", {}) if isinstance(data.get("slow_logs"), dict) else {}
+    slow_plugins = parse_slow_plugins(slow_logs.get("trace_plugins", []))
 
     return {
         "source": path,
@@ -141,6 +204,12 @@ def parse_health_json(path: str) -> dict:
         "report_json_path": path,
         "critical_issues": critical,
         "warnings": warnings,
+        "autoload_status": str(autoload.get("status", "N/A")),
+        "autoload_size_kb": str(autoload.get("size_kb", "N/A")),
+        "autoload_size_mb": str(autoload.get("size_mb", "N/A")),
+        "autoload_top_options": parse_autoload_options(autoload.get("top_autoload_options", [])),
+        "cleanup_metrics": flatten_nested_metrics("cleanup", cleanup),
+        "slow_plugins": slow_plugins,
     }
 
 
@@ -207,6 +276,9 @@ def merge_health(primary: dict, secondary: dict) -> dict:
         "daily_capacity",
         "db_size",
         "report_json_path",
+        "autoload_status",
+        "autoload_size_kb",
+        "autoload_size_mb",
     ]:
         pv = str(merged.get(k, "")).strip()
         sv = str(secondary.get(k, "")).strip()
@@ -223,6 +295,21 @@ def merge_health(primary: dict, secondary: dict) -> dict:
             warn.append(x)
     merged["critical_issues"] = crit
     merged["warnings"] = warn
+
+    for list_key in ("autoload_top_options", "cleanup_metrics", "slow_plugins"):
+        primary_items = list(merged.get(list_key, []) or [])
+        secondary_items = list(secondary.get(list_key, []) or [])
+        if not primary_items and secondary_items:
+            merged[list_key] = secondary_items
+            continue
+        # Preserve order while deduplicating.
+        seen = {json.dumps(item, sort_keys=True) for item in primary_items}
+        for item in secondary_items:
+            key = json.dumps(item, sort_keys=True)
+            if key not in seen:
+                primary_items.append(item)
+                seen.add(key)
+        merged[list_key] = primary_items
     return merged
 
 
@@ -287,6 +374,12 @@ def map_health_to_apps(top5: List[dict], records: List[dict], source_mode: str =
                 "db_size": "N/A",
                 "critical_issues": [],
                 "warnings": [],
+                "autoload_status": "N/A",
+                "autoload_size_kb": "N/A",
+                "autoload_size_mb": "N/A",
+                "autoload_top_options": [],
+                "cleanup_metrics": [],
+                "slow_plugins": [],
             }
         by_app[name] = chosen
     return by_app
@@ -422,6 +515,46 @@ def build_report_html(traffic: dict, health_by_app: Dict[str, dict], output_path
             )
         )
 
+        autoload_status = str(h.get("autoload_status", "N/A"))
+        autoload_alert = "normal"
+        if autoload_status.lower() in {"warning", "high", "critical", "bad"}:
+            autoload_alert = "high"
+        out.append(
+            render_kv_table(
+                "Autoload Health",
+                [
+                    ("Autoload Alert", autoload_alert),
+                    ("Autoload Status", autoload_status),
+                    ("Autoload Size (KB)", str(h.get("autoload_size_kb", "N/A"))),
+                    ("Autoload Size (MB)", str(h.get("autoload_size_mb", "N/A"))),
+                ],
+            )
+        )
+        out.append(
+            render_top_table(
+                "Autoload Top Options",
+                h.get("autoload_top_options", []),
+                "Option",
+                "Details",
+            )
+        )
+        out.append(
+            render_top_table(
+                "Slow Plugin Traces",
+                h.get("slow_plugins", []),
+                "Plugin",
+                "Trace Hits",
+            )
+        )
+        out.append(
+            render_top_table(
+                "Database Cleanup Details",
+                h.get("cleanup_metrics", []),
+                "Metric",
+                "Value",
+            )
+        )
+
         out.append(
             "<table><tr><th>Observation Notes (manual)</th><th>Priority</th><th>Owner</th><th>Target Date</th><th>Status</th></tr>"
             "<tr><td>[Add observation]</td><td>[High/Med/Low]</td><td>[Name]</td><td>[Date]</td><td>[Open/In Progress/Done]</td></tr></table>"
@@ -483,12 +616,23 @@ def build_reference_csv(top5: List[dict], health_by_app: Dict[str, dict], output
                 "db_size",
                 "source",
                 "report_json_path",
+                "autoload_status",
+                "autoload_size_kb",
+                "autoload_size_mb",
             ]:
                 w.writerow([name, "health", metric, h.get(metric, "N/A")])
             for idx, item in enumerate(h.get("critical_issues", []) or [], 1):
                 w.writerow([name, "health_critical_issues", str(idx), item])
             for idx, item in enumerate(h.get("warnings", []) or [], 1):
                 w.writerow([name, "health_warnings", str(idx), item])
+            for idx, item in enumerate(h.get("autoload_top_options", []) or [], 1):
+                label = item[0] if isinstance(item, (list, tuple)) and item else str(item)
+                value = item[1] if isinstance(item, (list, tuple)) and len(item) > 1 else ""
+                w.writerow([name, "health_autoload_top_options", f"{idx}:{label}", value])
+            for metric, value in h.get("cleanup_metrics", []) or []:
+                w.writerow([name, "health_cleanup", metric, value])
+            for plugin, count in h.get("slow_plugins", []) or []:
+                w.writerow([name, "health_slow_plugins", plugin, count])
 
 
 def main():

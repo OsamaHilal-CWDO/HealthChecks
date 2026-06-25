@@ -375,7 +375,7 @@ def run_health_script(public_html: Path, domain: str) -> dict:
     log_file = out_dir / f"{public_html.parent.name}.log"
     cmd = (
         "curl -sS https://raw.githubusercontent.com/OsamaHilal-CWDO/wooAuditor/refs/heads/main/wp_health_manager.py "
-        f"| python3 - https://{domain} --log-path ../logs/ --output-path /tmp/"
+        f"| python3 - https://{domain} --log-path ../logs/ --output-path /tmp/ --skip-health"
     )
 
     try:

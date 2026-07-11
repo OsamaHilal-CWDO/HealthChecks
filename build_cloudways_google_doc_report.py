@@ -550,14 +550,6 @@ def build_report_html(traffic: dict, health_by_app: Dict[str, dict], output_path
                 )
             )
             out.append(render_top_table("Top Query Parameters", qs.get("top_parameters", []), "Parameter", "Hits"))
-            out.append(
-                render_top_table(
-                    "Query Parameter Categories",
-                    qs.get("parameter_categories", []),
-                    "Category",
-                    "Hits",
-                )
-            )
 
         hourly = app.get("hourly_traffic", []) or []
         if hourly:
@@ -724,8 +716,6 @@ def build_reference_csv(top5: List[dict], health_by_app: Dict[str, dict], output
             qs = app.get("query_string_analysis", {}) or {}
             for k, v in qs.get("top_parameters", []) or []:
                 w.writerow([name, "query_string_top_parameters", str(k), str(v)])
-            for k, v in qs.get("parameter_categories", []) or []:
-                w.writerow([name, "query_string_categories", str(k), str(v)])
             for h in app.get("hourly_traffic", []) or []:
                 w.writerow(
                     [

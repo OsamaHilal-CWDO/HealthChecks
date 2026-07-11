@@ -30,23 +30,6 @@ CHROME_REFERENCE_MAJOR = 126
 CHROME_REFERENCE_DATE = datetime(2024, 6, 11, tzinfo=timezone.utc)
 CHROME_DAYS_PER_MAJOR = 40.5
 
-AD_CLICK_ID_PARAMS = {
-    "fbclid", "gclid", "gclsrc", "dclid", "msclkid", "ttclid", "yclid",
-    "twclid", "igshid", "wbraid", "gbraid", "mc_cid", "mc_eid", "epik",
-}
-WOOCOMMERCE_PARAMS = {
-    "add-to-cart", "add_to_cart", "wc-ajax", "wc-api", "removed_item",
-    "undo_item", "remove_item", "key", "order-received",
-}
-SORT_LAYOUT_PARAMS = {
-    "orderby", "order", "per_row", "shop_view", "per_page", "product_count",
-    "view", "mode", "sort", "sortby",
-}
-SEARCH_PARAMS = {"s", "q", "search", "query", "keyword", "term"}
-PAGINATION_PARAMS = {"page", "paged", "pg", "p", "product-page", "sf_paged"}
-CACHE_BUSTER_PARAMS = {"ver", "v", "cb", "_", "nocache", "cache", "ts", "rnd"}
-
-
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -164,38 +147,15 @@ def analyze_chrome_versions(
     }
 
 
-def classify_query_param(name: str) -> str:
-    n = name.strip().lower()
-    if n.startswith("utm_"):
-        return "utm_tracking"
-    if n in AD_CLICK_ID_PARAMS:
-        return "ad_click_id"
-    if n.startswith("filter") or n.startswith("query_type"):
-        return "faceted_filter"
-    if n in WOOCOMMERCE_PARAMS:
-        return "woocommerce_cart"
-    if n in SORT_LAYOUT_PARAMS:
-        return "sorting_layout"
-    if n in SEARCH_PARAMS:
-        return "search"
-    if n in PAGINATION_PARAMS:
-        return "pagination"
-    if n in CACHE_BUSTER_PARAMS:
-        return "cache_buster"
-    return "other"
-
-
-def analyze_query_strings(param_hits: Counter, requests_with_query: int, total_requests: int, top_n: int = 20):
+def analyze_query_strings(param_hits: Counter, requests_with_query: int, total_requests: int, top_n: int = 25):
+    """Generic parameter frequency: whatever appears after '?' gets counted, no
+    platform-specific assumptions (works for WooCommerce, Magento, custom, etc)."""
     percent = (requests_with_query / total_requests * 100.0) if total_requests else 0.0
-    categories = Counter()
-    for name, hits in param_hits.items():
-        categories[classify_query_param(name)] += hits
     return {
         "requests_with_query_string": requests_with_query,
         "percent_of_total": round(percent, 2),
         "distinct_parameters": len(param_hits),
         "top_parameters": [[k, v] for k, v in param_hits.most_common(top_n)],
-        "parameter_categories": [[k, v] for k, v in categories.most_common()],
     }
 
 
@@ -764,9 +724,6 @@ def render_report(top5, all_sorted, roots, geo_backend, out_json_path):
             out.append(f"  {'Parameter':<44}{'Hits':>8}")
             for name, hits in qs["top_parameters"]:
                 out.append(f"  {name:<44}{hits:>8}")
-            out.append("  Parameter categories:")
-            for cat, hits in qs.get("parameter_categories", []):
-                out.append(f"    - {cat}: {hits}")
         else:
             out.append("  - No query string traffic found")
 

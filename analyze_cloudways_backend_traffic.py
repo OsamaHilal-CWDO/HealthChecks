@@ -627,7 +627,7 @@ def count_requests(log_files):
     return total
 
 
-def render_report(top5, all_sorted, roots, geo_backend, out_json_path):
+def render_report(top5, all_sorted, roots, geo_backend, out_json_path, only_app: str = ""):
     out = []
     out.append("Cloudways Backend Access Traffic Summary")
     out.append(f"Generated: {now_utc_iso()}")
@@ -635,7 +635,10 @@ def render_report(top5, all_sorted, roots, geo_backend, out_json_path):
     out.append(f"GeoIP backend: {geo_backend}")
     out.append("")
 
-    out.append("Top 5 applications by total traffic")
+    if only_app:
+        out.append(f"Single application mode (--only-app {only_app})")
+    else:
+        out.append("Top 5 applications by total traffic")
     for idx, row in enumerate(top5, 1):
         out.append(f"{idx}. {row['app']} - {row['total_requests']} requests")
 
@@ -803,6 +806,14 @@ def main():
         action="store_true",
         help="Scan only --applications-root and do not auto-discover other /home roots",
     )
+    parser.add_argument(
+        "--only-app",
+        default="",
+        help=(
+            "Analyze only this application (directory name under the applications root, "
+            "e.g. abcdefghij). Skips ranking/processing of all other apps"
+        ),
+    )
     day_group = parser.add_mutually_exclusive_group()
     day_group.add_argument(
         "--days",
@@ -880,6 +891,28 @@ def main():
     ])
 
     progress_log(progress, f"Found {len(apps)} applications with backend logs")
+
+    if args.only_app:
+        if args.only_app in apps:
+            apps = {args.only_app: apps[args.only_app]}
+            progress_log(progress, f"Single-app mode: only analyzing {args.only_app}")
+        else:
+            available = ", ".join(sorted(apps.keys()))
+            payload = {
+                "generated_at": now_utc_iso(),
+                "error": f"Application '{args.only_app}' not found",
+                "roots": [str(x) for x in roots],
+                "available_applications": sorted(apps.keys()),
+            }
+            Path(args.output_json).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            Path(args.output_txt).write_text(
+                f"Application '{args.only_app}' not found under scanned roots.\n"
+                f"Available applications: {available}\n",
+                encoding="utf-8",
+            )
+            print(Path(args.output_txt).read_text(encoding="utf-8"))
+            return 1
+
     # First pass: rank all apps by total request count only (fast).
     progress_log(progress, "Pass 1/2: ranking all applications by request count")
     ranked_apps = []
@@ -981,6 +1014,7 @@ def main():
         "geoip_countryv6_dat": str(countryv6_dat) if countryv6_dat else "",
         "chrome_latest_major": chrome_latest,
         "chrome_obsolete_margin": args.chrome_obsolete_margin,
+        "only_app": args.only_app,
         "total_applications_found": len(ranked_apps),
         "top5": top5,
         "all_applications_sorted": [
@@ -990,7 +1024,7 @@ def main():
     }
 
     Path(args.output_json).write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    report_txt = render_report(top5, ranked_apps, roots, geo.backend, args.output_json)
+    report_txt = render_report(top5, ranked_apps, roots, geo.backend, args.output_json, only_app=args.only_app)
     Path(args.output_txt).write_text(report_txt, encoding="utf-8")
 
     progress_log(progress, f"Wrote outputs: {args.output_json} and {args.output_txt}")

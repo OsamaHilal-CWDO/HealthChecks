@@ -9,17 +9,42 @@ import re
 import shutil
 import subprocess
 import sys
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse
 
 BROWSER_UA_MARKERS = ("mozilla", "chrome", "chromium", "safari")
 REQUEST_RE = re.compile(r'"([A-Z]+)\s+([^\s"]+)\s+HTTP/[0-9.]+"')
 STATUS_RE = re.compile(r'"\s+(\d{3})\s+')
 IP_RE = re.compile(r'^(\S+)\s')
+TIME_RE = re.compile(r"\[(\d{2}/[A-Za-z]{3}/\d{4}):(\d{2}):(\d{2}):(\d{2})\s")
 BACKEND_LOG_DAY_RE = re.compile(r"\.access\.log(?:\.(\d+)(?:\.gz)?)?$")
+
+# Matches desktop Chrome, mobile Chrome on iOS (CriOS) and raw Chromium builds.
+CHROME_VERSION_RE = re.compile(r"(?:chrome|crios|chromium)/(\d+)", re.IGNORECASE)
+# Chrome 126 shipped on 2024-06-11; majors advance roughly every ~40 days.
+# Used only to *estimate* the newest plausible major when no override is given.
+CHROME_REFERENCE_MAJOR = 126
+CHROME_REFERENCE_DATE = datetime(2024, 6, 11, tzinfo=timezone.utc)
+CHROME_DAYS_PER_MAJOR = 40.5
+
+AD_CLICK_ID_PARAMS = {
+    "fbclid", "gclid", "gclsrc", "dclid", "msclkid", "ttclid", "yclid",
+    "twclid", "igshid", "wbraid", "gbraid", "mc_cid", "mc_eid", "epik",
+}
+WOOCOMMERCE_PARAMS = {
+    "add-to-cart", "add_to_cart", "wc-ajax", "wc-api", "removed_item",
+    "undo_item", "remove_item", "key", "order-received",
+}
+SORT_LAYOUT_PARAMS = {
+    "orderby", "order", "per_row", "shop_view", "per_page", "product_count",
+    "view", "mode", "sort", "sortby",
+}
+SEARCH_PARAMS = {"s", "q", "search", "query", "keyword", "term"}
+PAGINATION_PARAMS = {"page", "paged", "pg", "p", "product-page", "sf_paged"}
+CACHE_BUSTER_PARAMS = {"ver", "v", "cb", "_", "nocache", "cache", "ts", "rnd"}
 
 
 def now_utc_iso() -> str:
@@ -50,6 +75,8 @@ def parse_log_line(line: str):
     endpoint = "UNKNOWN"
     status = "UNKNOWN"
     user_agent = "UNKNOWN"
+    hour_key = ""
+    minute = -1
 
     m_ip = IP_RE.search(line)
     if m_ip:
@@ -63,50 +90,169 @@ def parse_log_line(line: str):
     if m_status:
         status = m_status.group(1)
 
+    m_time = TIME_RE.search(line)
+    if m_time:
+        hour_key = f"{m_time.group(1)}:{m_time.group(2)}"
+        minute = int(m_time.group(3))
+
     quoted = re.findall(r'"([^"]*)"', line)
     if quoted:
         user_agent = (quoted[-1] or "UNKNOWN").strip() or "UNKNOWN"
 
-    return ip, endpoint, status, user_agent
+    return ip, endpoint, status, user_agent, hour_key, minute
+
+
+def subnet_for_ip(ip: str) -> str | None:
+    """Aggregate IPv4 into /24 and IPv6 into /48 subnets."""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except Exception:
+        return None
+    prefix = 24 if addr.version == 4 else 48
+    try:
+        return str(ipaddress.ip_network(f"{ip}/{prefix}", strict=False))
+    except Exception:
+        return None
+
+
+def estimate_latest_chrome_major(now: datetime | None = None) -> int:
+    now = now or datetime.now(timezone.utc)
+    days = (now - CHROME_REFERENCE_DATE).days
+    return CHROME_REFERENCE_MAJOR + max(0, int(days / CHROME_DAYS_PER_MAJOR))
+
+
+def analyze_chrome_versions(
+    chrome_majors: Counter,
+    total_requests: int,
+    headless_requests: int,
+    latest_major: int,
+    obsolete_margin: int,
+):
+    claimed = sum(chrome_majors.values())
+    percent = (claimed / total_requests * 100.0) if total_requests else 0.0
+    obsolete_cutoff = latest_major - obsolete_margin
+
+    obsolete = {v: c for v, c in chrome_majors.items() if v <= obsolete_cutoff}
+    nonexistent = {v: c for v, c in chrome_majors.items() if v > latest_major}
+
+    def version_span(versions) -> str:
+        if not versions:
+            return ""
+        lo, hi = min(versions), max(versions)
+        return f"v{lo}" if lo == hi else f"v{lo}-v{hi}"
+
+    return {
+        "claimed_chrome_requests": claimed,
+        "claimed_chrome_percent": round(percent, 2),
+        "distinct_major_versions": len(chrome_majors),
+        "estimated_latest_major": latest_major,
+        "obsolete_cutoff_major": obsolete_cutoff,
+        "top_major_versions": [[f"v{v}", c] for v, c in chrome_majors.most_common(10)],
+        "spoofing_indicators": {
+            "obsolete_versions": {
+                "range": version_span(obsolete),
+                "distinct_versions": len(obsolete),
+                "requests": sum(obsolete.values()),
+            },
+            "nonexistent_versions": {
+                "range": version_span(nonexistent),
+                "distinct_versions": len(nonexistent),
+                "requests": sum(nonexistent.values()),
+            },
+            "headless_chrome_requests": headless_requests,
+        },
+    }
+
+
+def classify_query_param(name: str) -> str:
+    n = name.strip().lower()
+    if n.startswith("utm_"):
+        return "utm_tracking"
+    if n in AD_CLICK_ID_PARAMS:
+        return "ad_click_id"
+    if n.startswith("filter") or n.startswith("query_type"):
+        return "faceted_filter"
+    if n in WOOCOMMERCE_PARAMS:
+        return "woocommerce_cart"
+    if n in SORT_LAYOUT_PARAMS:
+        return "sorting_layout"
+    if n in SEARCH_PARAMS:
+        return "search"
+    if n in PAGINATION_PARAMS:
+        return "pagination"
+    if n in CACHE_BUSTER_PARAMS:
+        return "cache_buster"
+    return "other"
+
+
+def analyze_query_strings(param_hits: Counter, requests_with_query: int, total_requests: int, top_n: int = 20):
+    percent = (requests_with_query / total_requests * 100.0) if total_requests else 0.0
+    categories = Counter()
+    for name, hits in param_hits.items():
+        categories[classify_query_param(name)] += hits
+    return {
+        "requests_with_query_string": requests_with_query,
+        "percent_of_total": round(percent, 2),
+        "distinct_parameters": len(param_hits),
+        "top_parameters": [[k, v] for k, v in param_hits.most_common(top_n)],
+        "parameter_categories": [[k, v] for k, v in categories.most_common()],
+    }
+
+
+def build_hourly_stats(hourly_minute_counts, hourly_ips):
+    rows = []
+    for hour_key, minute_counts in hourly_minute_counts.items():
+        try:
+            sort_key = datetime.strptime(hour_key, "%d/%b/%Y:%H")
+        except ValueError:
+            sort_key = datetime.max
+        counts = list(minute_counts.values())
+        total = sum(counts)
+        rows.append(
+            {
+                "_sort": sort_key,
+                "hour": hour_key,
+                "min_per_minute": min(counts),
+                "avg_per_minute": round(total / len(counts), 1),
+                "max_per_minute": max(counts),
+                "total_requests": total,
+                "unique_ips": len(hourly_ips.get(hour_key, ())),
+            }
+        )
+    rows.sort(key=lambda r: r["_sort"])
+    for r in rows:
+        r.pop("_sort", None)
+    return rows
 
 
 class GeoResolver:
     def __init__(
         self,
         country_db: Path | None = None,
-        asn_db: Path | None = None,
         country_dat_v4: Path | None = None,
         country_dat_v6: Path | None = None,
-        enable_whois_asn: bool = True,
     ):
         self.country_reader = None
-        self.asn_reader = None
         self.legacy_country_v4 = None
         self.legacy_country_v6 = None
         self.geoiplookup_cmd = shutil.which("geoiplookup")
         self.geoiplookup6_cmd = shutil.which("geoiplookup6")
-        self.whois_cmd = shutil.which("whois")
-        self.enable_whois_asn = enable_whois_asn
         self.enabled = False
         self.backend = "none"
         self._country_cache = {}
-        self._asn_cache = {}
 
         try:
             import geoip2.database  # type: ignore
 
             if country_db and country_db.exists():
                 self.country_reader = geoip2.database.Reader(str(country_db))
-            if asn_db and asn_db.exists():
-                self.asn_reader = geoip2.database.Reader(str(asn_db))
-            if self.country_reader or self.asn_reader:
+            if self.country_reader:
                 self.enabled = True
                 self.backend = "mmdb"
         except Exception:
             self.enabled = False
 
         # Fallback to legacy .dat country DB (GeoIP.dat / GeoIPv6.dat).
-        # This fallback can provide country but not ASN.
         if not self.enabled:
             try:
                 import pygeoip  # type: ignore
@@ -121,14 +267,10 @@ class GeoResolver:
             except Exception:
                 self.enabled = False
 
-        # Fallback to system CLIs (geoip-bin + whois), no Python packages needed.
-        # Country comes from geoiplookup{,6}; ASN from whois (Team Cymru first).
-        if not self.enabled and (self.geoiplookup_cmd or self.geoiplookup6_cmd or self.whois_cmd):
+        # Fallback to system CLI (geoip-bin), no Python packages needed.
+        if not self.enabled and (self.geoiplookup_cmd or self.geoiplookup6_cmd):
             self.enabled = True
-            if self.geoiplookup_cmd or self.geoiplookup6_cmd:
-                self.backend = "cli-geoip"
-            else:
-                self.backend = "cli-whois-only"
+            self.backend = "cli-geoip"
 
     def _lookup_country_cli(self, ip: str) -> str:
         try:
@@ -158,112 +300,17 @@ class GeoResolver:
             pass
         return "UNKNOWN"
 
-    def _lookup_asn_whois(self, ip: str) -> str:
-        if not self.whois_cmd or not self.enable_whois_asn:
-            return "UNKNOWN"
-
-        # Try Team Cymru first; it's concise and consistent for ASN lookup.
-        try:
-            proc = subprocess.run(
-                [self.whois_cmd, "-h", "whois.cymru.com", f" -v {ip}"],
-                capture_output=True,
-                text=True,
-                timeout=8,
-                check=False,
-            )
-            out = f"{proc.stdout}\n{proc.stderr}"
-            for line in out.splitlines():
-                if "|" not in line or "AS" in line.upper():
-                    continue
-                m = re.match(r"\s*(\d+)\s*\|", line)
-                if m:
-                    return f"AS{m.group(1)}"
-        except Exception:
-            pass
-
-        # Fallback to standard whois parsing.
-        try:
-            proc = subprocess.run(
-                [self.whois_cmd, ip],
-                capture_output=True,
-                text=True,
-                timeout=8,
-                check=False,
-            )
-            out = f"{proc.stdout}\n{proc.stderr}"
-            m = re.search(r"(?im)^\s*(?:origin|originas|aut-num)\s*:\s*(AS\d+)\b", out)
-            if m:
-                return m.group(1).upper()
-            m = re.search(r"\bAS(\d{1,10})\b", out)
-            if m:
-                return f"AS{m.group(1)}"
-        except Exception:
-            pass
-        return "UNKNOWN"
-
-    def _bulk_lookup_asn_whois(self, ips):
-        """
-        Resolve ASN for many IPs in fewer whois calls.
-        Uses Team Cymru bulk mode and caches all queried IPs.
-        """
-        if not self.whois_cmd or not self.enable_whois_asn:
-            return
-
-        to_query = [ip for ip in ips if ip not in self._asn_cache]
-        if not to_query:
-            return
-
-        chunk_size = 300
-        for i in range(0, len(to_query), chunk_size):
-            chunk = to_query[i : i + chunk_size]
-            payload = "begin\nverbose\n" + "\n".join(chunk) + "\nend\n"
-            resolved = {}
-
-            try:
-                proc = subprocess.run(
-                    [self.whois_cmd, "-h", "whois.cymru.com"],
-                    input=payload,
-                    capture_output=True,
-                    text=True,
-                    timeout=25,
-                    check=False,
-                )
-                out = f"{proc.stdout}\n{proc.stderr}"
-                for line in out.splitlines():
-                    if "|" not in line:
-                        continue
-                    parts = [p.strip() for p in line.split("|")]
-                    if len(parts) < 2:
-                        continue
-                    asn_num = parts[0]
-                    ip_val = parts[1]
-                    if not asn_num.isdigit():
-                        continue
-                    if ip_val:
-                        resolved[ip_val] = f"AS{asn_num}"
-            except Exception:
-                pass
-
-            # Ensure every queried IP gets cached to avoid repeated slow fallbacks.
-            for ip in chunk:
-                self._asn_cache[ip] = resolved.get(ip, "UNKNOWN")
-
-    def prewarm_asn(self, ips):
-        if self.backend in ("cli-geoip", "cli-whois-only"):
-            self._bulk_lookup_asn_whois(ips)
-
     @lru_cache(maxsize=200000)
-    def lookup(self, ip: str):
+    def lookup(self, ip: str) -> str:
         country = "UNKNOWN"
-        asn = "UNKNOWN"
 
         try:
             ipaddress.ip_address(ip)
         except Exception:
-            return country, asn
+            return country
 
         if not self.enabled:
-            return country, asn
+            return country
 
         if self.backend == "mmdb":
             try:
@@ -272,14 +319,6 @@ class GeoResolver:
                     cc = (res.country.iso_code or "").strip().upper()
                     if cc:
                         country = cc
-            except Exception:
-                pass
-
-            try:
-                if self.asn_reader:
-                    res = self.asn_reader.asn(ip)
-                    if res.autonomous_system_number:
-                        asn = f"AS{res.autonomous_system_number}"
             except Exception:
                 pass
         elif self.backend == "legacy-dat":
@@ -292,27 +331,19 @@ class GeoResolver:
                         country = cc
             except Exception:
                 pass
-        elif self.backend in ("cli-geoip", "cli-whois-only"):
+        elif self.backend == "cli-geoip":
             if ip in self._country_cache:
                 country = self._country_cache[ip]
             else:
                 country = self._lookup_country_cli(ip)
                 self._country_cache[ip] = country
 
-            if ip in self._asn_cache:
-                asn = self._asn_cache[ip]
-            else:
-                asn = self._lookup_asn_whois(ip)
-                self._asn_cache[ip] = asn
-
-        return country, asn
+        return country
 
     def close(self):
         try:
             if self.country_reader:
                 self.country_reader.close()
-            if self.asn_reader:
-                self.asn_reader.close()
         except Exception:
             pass
 
@@ -493,15 +524,31 @@ def select_log_files_by_days(log_files, days: int | None):
     return [lf for lf in ordered if backend_log_day_index(lf) <= days]
 
 
-def summarize_app(app: str, app_dir: Path, log_files, geo: GeoResolver, progress: bool = False):
+def summarize_app(
+    app: str,
+    app_dir: Path,
+    log_files,
+    geo: GeoResolver,
+    progress: bool = False,
+    chrome_latest_major: int = 0,
+    chrome_obsolete_margin: int = 40,
+):
     total = 0
     ip_hits = Counter()
     countries = Counter()
-    asns = Counter()
     endpoints = Counter()
     statuses = Counter()
     ua_non_browser = Counter()
     daily_stats = []
+
+    chrome_majors = Counter()
+    headless_chrome_requests = 0
+
+    query_param_hits = Counter()
+    requests_with_query = 0
+
+    hourly_minute_counts = defaultdict(Counter)
+    hourly_ips = defaultdict(set)
 
     progress_log(progress, f"[{app}] parsing {len(log_files)} log files")
     for idx, lf in enumerate(log_files, start=1):
@@ -511,13 +558,36 @@ def summarize_app(app: str, app_dir: Path, log_files, geo: GeoResolver, progress
                 continue
             total += 1
             file_lines += 1
-            ip, endpoint, status, ua = parse_log_line(line)
+            ip, endpoint, status, ua, hour_key, minute = parse_log_line(line)
 
             endpoints[endpoint] += 1
             statuses[status] += 1
             ip_hits[ip] += 1
 
+            if hour_key:
+                hourly_minute_counts[hour_key][minute] += 1
+                hourly_ips[hour_key].add(ip)
+
+            if "?" in endpoint:
+                requests_with_query += 1
+                query = endpoint.split("?", 1)[1]
+                try:
+                    names = {name for name, _ in parse_qsl(query, keep_blank_values=True)}
+                except Exception:
+                    names = set()
+                for name in names:
+                    query_param_hits[name] += 1
+
             ua_l = ua.lower()
+            m_chrome = CHROME_VERSION_RE.search(ua)
+            if m_chrome:
+                try:
+                    chrome_majors[int(m_chrome.group(1))] += 1
+                except ValueError:
+                    pass
+                if "headless" in ua_l:
+                    headless_chrome_requests += 1
+
             if (
                 ua not in {"UNKNOWN", "-", ""}
                 and not any(marker in ua_l for marker in BROWSER_UA_MARKERS)
@@ -534,18 +604,37 @@ def summarize_app(app: str, app_dir: Path, log_files, geo: GeoResolver, progress
         )
         progress_log(progress, f"[{app}] parsed file {idx}/{len(log_files)}: {lf.name} ({file_lines} lines)")
 
-    # Batch ASN lookups for CLI backend to avoid one whois call per unique IP.
     progress_log(progress, f"[{app}] collected {len(ip_hits)} unique IPs from {total} requests")
-    geo.prewarm_asn(tuple(ip_hits.keys()))
-    progress_log(progress, f"[{app}] ASN prewarm completed")
+
+    # Aggregate unique IPs into subnets (/24 IPv4, /48 IPv6).
+    subnet_hits = Counter()
+    subnet_unique_ips = Counter()
     processed_ips = 0
     for ip, cnt in ip_hits.items():
-        cc, asn = geo.lookup(ip)
-        countries[cc] += cnt
-        asns[asn] += cnt
+        countries[geo.lookup(ip)] += cnt
+        subnet = subnet_for_ip(ip)
+        if subnet:
+            subnet_hits[subnet] += cnt
+            subnet_unique_ips[subnet] += 1
         processed_ips += 1
         if progress and processed_ips % 1000 == 0:
             progress_log(progress, f"[{app}] geo-enriched {processed_ips}/{len(ip_hits)} unique IPs")
+
+    top_ip_subnets = [
+        {"subnet": subnet, "requests": cnt, "unique_ips": subnet_unique_ips[subnet]}
+        for subnet, cnt in subnet_hits.most_common(10)
+    ]
+
+    latest_major = chrome_latest_major if chrome_latest_major > 0 else estimate_latest_chrome_major()
+    user_agent_analysis = analyze_chrome_versions(
+        chrome_majors,
+        total,
+        headless_chrome_requests,
+        latest_major,
+        chrome_obsolete_margin,
+    )
+    query_string_analysis = analyze_query_strings(query_param_hits, requests_with_query, total)
+    hourly_traffic = build_hourly_stats(hourly_minute_counts, hourly_ips)
 
     error_count = sum(v for k, v in statuses.items() if k.isdigit() and (k.startswith("4") or k.startswith("5")))
     error_rate = (error_count / total * 100.0) if total else 0.0
@@ -556,9 +645,12 @@ def summarize_app(app: str, app_dir: Path, log_files, geo: GeoResolver, progress
         "app_dir": str(app_dir),
         "total_requests": total,
         "top_countries": countries.most_common(10),
-        "top_asn": asns.most_common(10),
+        "top_ip_subnets": top_ip_subnets,
         "top_endpoints": endpoints.most_common(10),
         "top_non_browser_user_agents": ua_non_browser.most_common(10),
+        "user_agent_analysis": user_agent_analysis,
+        "query_string_analysis": query_string_analysis,
+        "hourly_traffic": hourly_traffic,
         "status_breakdown": sorted(statuses.items(), key=lambda x: x[0]),
         "error_count": error_count,
         "error_rate_percent": round(error_rate, 2),
@@ -606,9 +698,13 @@ def render_report(top5, all_sorted, roots, geo_backend, out_json_path):
         for k, v in row["top_countries"]:
             out.append(f"  - {k}: {v}")
 
-        out.append("\nTop ASN:")
-        for k, v in row["top_asn"]:
-            out.append(f"  - {k}: {v}")
+        out.append("\nTop IP Subnets (/24 IPv4, /48 IPv6):")
+        if row["top_ip_subnets"]:
+            out.append(f"  {'Subnet':<28}{'Requests':>10}{'Unique IPs':>12}")
+            for s in row["top_ip_subnets"]:
+                out.append(f"  {s['subnet']:<28}{s['requests']:>10}{s['unique_ips']:>12}")
+        else:
+            out.append("  - None found")
 
         out.append("\nTop Endpoints:")
         for k, v in row["top_endpoints"]:
@@ -620,6 +716,71 @@ def render_report(top5, all_sorted, roots, geo_backend, out_json_path):
                 out.append(f"  - {k}: {v}")
         else:
             out.append("  - None found")
+
+        ua = row.get("user_agent_analysis", {})
+        spoof = ua.get("spoofing_indicators", {})
+        out.append("\nUser-Agent (Chrome/Chromium) Analysis:")
+        out.append(
+            f"  Claimed Chrome traffic: {ua.get('claimed_chrome_requests', 0)} requests "
+            f"({ua.get('claimed_chrome_percent', 0)}%)"
+        )
+        out.append(f"  Distinct Chrome major versions: {ua.get('distinct_major_versions', 0)}")
+        out.append(
+            f"  Latest known Chrome major used for checks: v{ua.get('estimated_latest_major', '?')} "
+            f"(obsolete cutoff: v{ua.get('obsolete_cutoff_major', '?')} and older)"
+        )
+        out.append("  Spoofing indicators:")
+        obsolete = spoof.get("obsolete_versions", {})
+        nonexistent = spoof.get("nonexistent_versions", {})
+        if obsolete.get("requests"):
+            out.append(
+                f"    - Obsolete Chrome {obsolete.get('range', '')}: {obsolete['requests']} requests "
+                f"across {obsolete.get('distinct_versions', 0)} outdated major versions"
+            )
+        else:
+            out.append("    - Obsolete Chrome versions: none detected")
+        if nonexistent.get("requests"):
+            out.append(
+                f"    - Non-existent Chrome {nonexistent.get('range', '')}: {nonexistent['requests']} requests "
+                f"(versions above latest known release)"
+            )
+        else:
+            out.append("    - Non-existent (future) Chrome versions: none detected")
+        if spoof.get("headless_chrome_requests"):
+            out.append(f"    - HeadlessChrome: {spoof['headless_chrome_requests']} requests")
+        if ua.get("top_major_versions"):
+            out.append("  Top claimed Chrome majors:")
+            for ver, cnt in ua["top_major_versions"]:
+                out.append(f"    - {ver}: {cnt}")
+
+        qs = row.get("query_string_analysis", {})
+        out.append("\nQuery String Analysis:")
+        out.append(
+            f"  Requests with query strings: {qs.get('requests_with_query_string', 0)} "
+            f"({qs.get('percent_of_total', 0)}% of total)"
+        )
+        if qs.get("top_parameters"):
+            out.append(f"  Distinct parameters seen: {qs.get('distinct_parameters', 0)}")
+            out.append(f"  {'Parameter':<44}{'Hits':>8}")
+            for name, hits in qs["top_parameters"]:
+                out.append(f"  {name:<44}{hits:>8}")
+            out.append("  Parameter categories:")
+            for cat, hits in qs.get("parameter_categories", []):
+                out.append(f"    - {cat}: {hits}")
+        else:
+            out.append("  - No query string traffic found")
+
+        out.append("\nHourly Traffic (requests/minute stats + unique IPs):")
+        hourly = row.get("hourly_traffic", [])
+        if hourly:
+            out.append(f"  {'Hour':<20}{'Min/min':>9}{'Avg/min':>9}{'Max/min':>9}{'Total':>10}{'Unique IPs':>12}")
+            for h in hourly:
+                out.append(
+                    f"  {h['hour']:<20}{h['min_per_minute']:>9}{h['avg_per_minute']:>9}"
+                    f"{h['max_per_minute']:>9}{h['total_requests']:>10}{h['unique_ips']:>12}"
+                )
+        else:
+            out.append("  - No timestamps parsed from logs")
 
         out.append("\nStatus Breakdown:")
         for code, cnt in row["status_breakdown"]:
@@ -662,15 +823,24 @@ def main():
         action="store_true",
         help="Print progress updates to stderr",
     )
-    parser.add_argument(
-        "--disable-whois-asn",
-        action="store_true",
-        help="Disable whois ASN resolution to speed up analysis",
-    )
     parser.add_argument("--country-mmdb", default="")
-    parser.add_argument("--asn-mmdb", default="")
     parser.add_argument("--country-dat", default="")
     parser.add_argument("--countryv6-dat", default="")
+    parser.add_argument(
+        "--chrome-latest-major",
+        type=int,
+        default=0,
+        help=(
+            "Latest released Chrome major version, used to flag non-existent/spoofed versions. "
+            "Default 0 = auto-estimate from release cadence"
+        ),
+    )
+    parser.add_argument(
+        "--chrome-obsolete-margin",
+        type=int,
+        default=40,
+        help="Chrome majors this far (or more) behind the latest are flagged as obsolete",
+    )
     parser.add_argument(
         "--strict-root",
         action="store_true",
@@ -741,11 +911,6 @@ def main():
         "/usr/local/share/GeoIP/GeoLite2-Country.mmdb",
         "/var/lib/GeoIP/GeoLite2-Country.mmdb",
     ])
-    asn_db = Path(args.asn_mmdb) if args.asn_mmdb else find_default_geoip_path([
-        "/usr/share/GeoIP/GeoLite2-ASN.mmdb",
-        "/usr/local/share/GeoIP/GeoLite2-ASN.mmdb",
-        "/var/lib/GeoIP/GeoLite2-ASN.mmdb",
-    ])
     country_dat = Path(args.country_dat) if args.country_dat else find_default_geoip_path([
         "/usr/share/GeoIP/GeoIP.dat",
         "/usr/local/share/GeoIP/GeoIP.dat",
@@ -800,14 +965,15 @@ def main():
 
     # Second pass: full enrichment only for top 5 apps.
     progress_log(progress, "Pass 2/2: enriching top 5 applications")
-    geo = GeoResolver(
-        country_db,
-        asn_db,
-        country_dat,
-        countryv6_dat,
-        enable_whois_asn=not args.disable_whois_asn,
+    geo = GeoResolver(country_db, country_dat, countryv6_dat)
+    progress_log(progress, f"Geo backend selected: {geo.backend}")
+    chrome_latest = args.chrome_latest_major if args.chrome_latest_major > 0 else estimate_latest_chrome_major()
+    progress_log(
+        progress,
+        f"Chrome version checks: latest_major=v{chrome_latest} "
+        f"({'override' if args.chrome_latest_major > 0 else 'auto-estimated'}), "
+        f"obsolete_margin={args.chrome_obsolete_margin}",
     )
-    progress_log(progress, f"Geo backend selected: {geo.backend} (whois_asn_enabled={not args.disable_whois_asn})")
     top5 = []
     for idx, row in enumerate(top5_candidates, start=1):
         progress_log(progress, f"[top {idx}/{len(top5_candidates)}] processing {row['app']}")
@@ -818,6 +984,8 @@ def main():
                 row["log_files"],
                 geo,
                 progress=progress,
+                chrome_latest_major=chrome_latest,
+                chrome_obsolete_margin=args.chrome_obsolete_margin,
             )
         )
     geo.close()
@@ -850,12 +1018,12 @@ def main():
         "roots_scanned": [str(x) for x in roots],
         "geoip_enabled": geo.enabled,
         "geoip_backend": geo.backend,
-        "whois_asn_enabled": not args.disable_whois_asn,
         "days_filter": args.days if args.days is not None else "all",
         "geoip_country_db": str(country_db) if country_db else "",
-        "geoip_asn_db": str(asn_db) if asn_db else "",
         "geoip_country_dat": str(country_dat) if country_dat else "",
         "geoip_countryv6_dat": str(countryv6_dat) if countryv6_dat else "",
+        "chrome_latest_major": chrome_latest,
+        "chrome_obsolete_margin": args.chrome_obsolete_margin,
         "total_applications_found": len(ranked_apps),
         "top5": top5,
         "all_applications_sorted": [

@@ -1235,9 +1235,10 @@ def main():
     time_end = None
     if args.hour is not None:
         time_start = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=args.hour)
-        # Timestamp filtering makes the day-slot file limit unnecessary; scan all
-        # rotated files so windows spanning rotation boundaries are fully covered.
-        args.days = None
+        # Only read the rotated files that can contain the window (1-24h ->
+        # access.log, 25-48h -> + access.log.1, ...); timestamp filtering
+        # still applies line by line within those files.
+        args.days = (args.hour + 23) // 24
     if args.from_time:
         time_start = parse_user_time(args.from_time)
         if time_start is None:

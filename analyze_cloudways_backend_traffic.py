@@ -10,7 +10,7 @@ import shutil
 import subprocess
 import sys
 from collections import Counter, defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import parse_qsl, urlparse
@@ -19,8 +19,13 @@ BROWSER_UA_MARKERS = ("mozilla", "chrome", "chromium", "safari")
 REQUEST_RE = re.compile(r'"([A-Z]+)\s+([^\s"]+)\s+HTTP/[0-9.]+"')
 STATUS_RE = re.compile(r'"\s+(\d{3})\s+')
 IP_RE = re.compile(r'^(\S+)\s')
-TIME_RE = re.compile(r"\[(\d{2}/[A-Za-z]{3}/\d{4}):(\d{2}):(\d{2}):(\d{2})\s")
+TIME_RE = re.compile(r"\[(\d{2})/([A-Za-z]{3})/(\d{4}):(\d{2}):(\d{2}):(\d{2})\s")
 BACKEND_LOG_DAY_RE = re.compile(r"\.access\.log(?:\.(\d+)(?:\.gz)?)?$")
+
+MONTH_NUM = {
+    "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
+    "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
+}
 
 # Matches desktop Chrome, mobile Chrome on iOS (CriOS) and raw Chromium builds.
 CHROME_VERSION_RE = re.compile(r"(?:chrome|crios|chromium)/(\d+)", re.IGNORECASE)
@@ -58,6 +63,7 @@ def parse_log_line(line: str):
     endpoint = "UNKNOWN"
     status = "UNKNOWN"
     user_agent = "UNKNOWN"
+    timestamp = None
     hour_key = ""
     minute = -1
 
@@ -75,14 +81,47 @@ def parse_log_line(line: str):
 
     m_time = TIME_RE.search(line)
     if m_time:
-        hour_key = f"{m_time.group(1)}:{m_time.group(2)}"
-        minute = int(m_time.group(3))
+        day, mon, year, hh, mm, ss = m_time.groups()
+        month = MONTH_NUM.get(mon)
+        if month:
+            try:
+                timestamp = datetime(int(year), month, int(day), int(hh), int(mm), int(ss))
+                hour_key = f"{day}/{mon}/{year}:{hh}"
+                minute = int(mm)
+            except ValueError:
+                timestamp = None
 
     quoted = re.findall(r'"([^"]*)"', line)
     if quoted:
         user_agent = (quoted[-1] or "UNKNOWN").strip() or "UNKNOWN"
 
-    return ip, endpoint, status, user_agent, hour_key, minute
+    return ip, endpoint, status, user_agent, timestamp, hour_key, minute
+
+
+def parse_line_timestamp(line: str) -> datetime | None:
+    m = TIME_RE.search(line)
+    if not m:
+        return None
+    day, mon, year, hh, mm, ss = m.groups()
+    month = MONTH_NUM.get(mon)
+    if not month:
+        return None
+    try:
+        return datetime(int(year), month, int(day), int(hh), int(mm), int(ss))
+    except ValueError:
+        return None
+
+
+def in_time_window(ts: datetime | None, start: datetime | None, end: datetime | None) -> bool:
+    if start is None and end is None:
+        return True
+    if ts is None:
+        return False
+    if start is not None and ts < start:
+        return False
+    if end is not None and ts > end:
+        return False
+    return True
 
 
 def subnet_for_ip(ip: str) -> str | None:
@@ -492,7 +531,10 @@ def summarize_app(
     progress: bool = False,
     chrome_latest_major: int = 0,
     chrome_obsolete_margin: int = 40,
+    time_start: datetime | None = None,
+    time_end: datetime | None = None,
 ):
+    time_filtered = time_start is not None or time_end is not None
     total = 0
     ip_hits = Counter()
     countries = Counter()
@@ -516,9 +558,11 @@ def summarize_app(
         for line in iter_log_lines(lf):
             if not line.strip():
                 continue
+            ip, endpoint, status, ua, timestamp, hour_key, minute = parse_log_line(line)
+            if time_filtered and not in_time_window(timestamp, time_start, time_end):
+                continue
             total += 1
             file_lines += 1
-            ip, endpoint, status, ua, hour_key, minute = parse_log_line(line)
 
             endpoints[endpoint] += 1
             statuses[status] += 1
@@ -562,7 +606,10 @@ def summarize_app(
                 "avg_requests_per_minute": round(file_lines / 1440.0, 4),
             }
         )
-        progress_log(progress, f"[{app}] parsed file {idx}/{len(log_files)}: {lf.name} ({file_lines} lines)")
+        progress_log(
+            progress,
+            f"[{app}] parsed file {idx}/{len(log_files)}: {lf.name} ({file_lines} matching lines)",
+        )
 
     progress_log(progress, f"[{app}] collected {len(ip_hits)} unique IPs from {total} requests")
 
@@ -618,21 +665,47 @@ def summarize_app(
     }
 
 
-def count_requests(log_files):
+def count_requests(log_files, time_start: datetime | None = None, time_end: datetime | None = None):
+    time_filtered = time_start is not None or time_end is not None
     total = 0
     for lf in log_files:
         for line in iter_log_lines(lf):
-            if line.strip():
-                total += 1
+            if not line.strip():
+                continue
+            if time_filtered and not in_time_window(parse_line_timestamp(line), time_start, time_end):
+                continue
+            total += 1
     return total
 
 
-def render_report(top5, all_sorted, roots, geo_backend, out_json_path, only_app: str = ""):
+def parse_user_time(value: str) -> datetime | None:
+    """Accept 'DD-MM-YYYY:HH' or 'DD-MM-YYYY:HH:MM' (UTC). Returns None if invalid."""
+    for fmt in ("%d-%m-%Y:%H:%M", "%d-%m-%Y:%H"):
+        try:
+            return datetime.strptime(value.strip(), fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def describe_time_window(time_start: datetime | None, time_end: datetime | None, hours: int | None) -> str:
+    if hours is not None:
+        return f"last {hours} hour(s) (since {time_start:%d/%b/%Y %H:%M} UTC)"
+    if time_start is not None or time_end is not None:
+        start_s = f"{time_start:%d/%b/%Y %H:%M}" if time_start else "beginning of logs"
+        end_s = f"{time_end:%d/%b/%Y %H:%M}" if time_end else "end of logs"
+        return f"from {start_s} to {end_s} (UTC)"
+    return "all available log data"
+
+
+def render_report(top5, all_sorted, roots, geo_backend, out_json_path, only_app: str = "", time_window_desc: str = ""):
     out = []
     out.append("Cloudways Backend Access Traffic Summary")
     out.append(f"Generated: {now_utc_iso()}")
     out.append(f"Roots scanned: {', '.join(str(r) for r in roots)}")
     out.append(f"GeoIP backend: {geo_backend}")
+    if time_window_desc:
+        out.append(f"Time window: {time_window_desc}")
     out.append("")
 
     if only_app:
@@ -829,11 +902,59 @@ def main():
         action="store_true",
         help="Use all available rotated logs (default behavior)",
     )
+    day_group.add_argument(
+        "--hour",
+        type=int,
+        default=None,
+        help=(
+            "Only analyze the last N hours of traffic (UTC, based on log timestamps). "
+            "e.g. --hour 1 = last hour, --hour 12 = last 12 hours. Cannot be combined with --days"
+        ),
+    )
+    parser.add_argument(
+        "--from-time",
+        default="",
+        help="Start of scan window in UTC, format DD-MM-YYYY:HH or DD-MM-YYYY:HH:MM (e.g. 10-07-2026:00)",
+    )
+    parser.add_argument(
+        "--to-time",
+        default="",
+        help="End of scan window in UTC, format DD-MM-YYYY:HH or DD-MM-YYYY:HH:MM (e.g. 10-07-2026:14:30)",
+    )
     args = parser.parse_args()
     if args.days is not None and args.days < 1:
         parser.error("--days must be >= 1")
     if args.all_days:
         args.days = None
+    if args.hour is not None and args.hour < 1:
+        parser.error("--hour must be >= 1")
+    if args.hour is not None and (args.from_time or args.to_time):
+        parser.error("--hour cannot be combined with --from-time/--to-time")
+    if args.days is not None and (args.from_time or args.to_time):
+        parser.error("--days cannot be combined with --from-time/--to-time (the window may span rotated files)")
+
+    time_start = None
+    time_end = None
+    if args.hour is not None:
+        time_start = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=args.hour)
+        # Timestamp filtering makes the day-slot file limit unnecessary; scan all
+        # rotated files so windows spanning rotation boundaries are fully covered.
+        args.days = None
+    if args.from_time:
+        time_start = parse_user_time(args.from_time)
+        if time_start is None:
+            parser.error(f"Invalid --from-time '{args.from_time}'. Expected DD-MM-YYYY:HH or DD-MM-YYYY:HH:MM (UTC)")
+    if args.to_time:
+        time_end = parse_user_time(args.to_time)
+        if time_end is None:
+            parser.error(f"Invalid --to-time '{args.to_time}'. Expected DD-MM-YYYY:HH or DD-MM-YYYY:HH:MM (UTC)")
+        if len(args.to_time.strip().split(":")) == 2:
+            # Hour-only end bound: include the whole hour.
+            time_end = time_end.replace(minute=59, second=59)
+    if time_start and time_end and time_start > time_end:
+        parser.error("--from-time must be earlier than --to-time")
+
+    time_window_desc = describe_time_window(time_start, time_end, args.hour)
 
     progress = args.progress
     progress_log(progress, "Starting backend access log analysis")
@@ -914,14 +1035,14 @@ def main():
             return 1
 
     # First pass: rank all apps by total request count only (fast).
-    progress_log(progress, "Pass 1/2: ranking all applications by request count")
+    progress_log(progress, f"Pass 1/2: ranking all applications by request count ({time_window_desc})")
     ranked_apps = []
     for idx, (app, data) in enumerate(apps.items(), start=1):
         selected_logs = select_log_files_by_days(data["log_files"], args.days)
         if not selected_logs:
             progress_log(progress, f"[rank {idx}/{len(apps)}] {app}: skipped (no logs in selected day window)")
             continue
-        total = count_requests(selected_logs)
+        total = count_requests(selected_logs, time_start, time_end)
         ranked_apps.append(
             {
                 "app": app,
@@ -976,6 +1097,8 @@ def main():
                 progress=progress,
                 chrome_latest_major=chrome_latest,
                 chrome_obsolete_margin=args.chrome_obsolete_margin,
+                time_start=time_start,
+                time_end=time_end,
             )
         )
     geo.close()
@@ -1015,6 +1138,9 @@ def main():
         "chrome_latest_major": chrome_latest,
         "chrome_obsolete_margin": args.chrome_obsolete_margin,
         "only_app": args.only_app,
+        "time_window": time_window_desc,
+        "time_window_start_utc": time_start.isoformat() if time_start else "",
+        "time_window_end_utc": time_end.isoformat() if time_end else "",
         "total_applications_found": len(ranked_apps),
         "top5": top5,
         "all_applications_sorted": [
@@ -1024,7 +1150,15 @@ def main():
     }
 
     Path(args.output_json).write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    report_txt = render_report(top5, ranked_apps, roots, geo.backend, args.output_json, only_app=args.only_app)
+    report_txt = render_report(
+        top5,
+        ranked_apps,
+        roots,
+        geo.backend,
+        args.output_json,
+        only_app=args.only_app,
+        time_window_desc=time_window_desc,
+    )
     Path(args.output_txt).write_text(report_txt, encoding="utf-8")
 
     progress_log(progress, f"Wrote outputs: {args.output_json} and {args.output_txt}")

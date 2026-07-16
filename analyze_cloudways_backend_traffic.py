@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import glob
 import gzip
 import ipaddress
 import json
@@ -222,6 +223,181 @@ def build_hourly_stats(hourly_minute_counts, hourly_ips):
     for r in rows:
         r.pop("_sort", None)
     return rows
+
+
+# --- PHP-FPM max_children breach & OOM analysis -------------------------------
+
+FPM_BREACH_RE = re.compile(
+    r"\[(\d{1,2})-([A-Za-z]{3})-(\d{4})\s+(\d{2}):(\d{2}):(\d{2})\]\s+WARNING:\s+\[pool ([^\]]+)\]\s+"
+    r"server reached pm\.max_children setting \((\d+)\)"
+)
+OOM_KILLED_RE = re.compile(r"Out of memory: Killed process \d+ \(([^)]+)\)", re.IGNORECASE)
+OOM_REAPED_RE = re.compile(r"oom_reaper: reaped process \d+ \(([^)]+)\)", re.IGNORECASE)
+SYSLOG_ISO_TS_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})")
+SYSLOG_CLASSIC_TS_RE = re.compile(r"^([A-Za-z]{3})\s+(\d{1,2})\s+(\d{2}):(\d{2}):(\d{2})")
+FPM_CLUSTER_GAP_SECONDS = 120
+OOM_CLUSTER_GAP_SECONDS = 600
+EVENT_TS_FMT = "%d/%b/%Y %H:%M:%S"
+
+
+def scan_fpm_breach_logs(pattern: str, time_start: datetime | None, time_end: datetime | None):
+    events = []
+    files = sorted(glob.glob(pattern))
+    for fp in files:
+        for line in iter_log_lines(Path(fp)):
+            m = FPM_BREACH_RE.search(line)
+            if not m:
+                continue
+            day, mon, year, hh, mm, ss, pool, limit = m.groups()
+            month = MONTH_NUM.get(mon)
+            if not month:
+                continue
+            try:
+                dt = datetime(int(year), month, int(day), int(hh), int(mm), int(ss))
+            except ValueError:
+                continue
+            if not in_time_window(dt, time_start, time_end):
+                continue
+            events.append({"dt": dt, "pool": pool.strip(), "limit": int(limit)})
+    events.sort(key=lambda e: e["dt"])
+    return events, files
+
+
+def parse_syslog_timestamp(line: str, now: datetime) -> datetime | None:
+    m = SYSLOG_ISO_TS_RE.match(line)
+    if m:
+        y, mo, d, hh, mm, ss = (int(x) for x in m.groups())
+        try:
+            return datetime(y, mo, d, hh, mm, ss)
+        except ValueError:
+            return None
+    m = SYSLOG_CLASSIC_TS_RE.match(line)
+    if m:
+        month = MONTH_NUM.get(m.group(1))
+        if not month:
+            return None
+        try:
+            dt = datetime(now.year, month, int(m.group(2)), int(m.group(3)), int(m.group(4)), int(m.group(5)))
+        except ValueError:
+            return None
+        # Classic syslog has no year; a "future" date means it was last year.
+        if dt > now + timedelta(days=1):
+            dt = dt.replace(year=now.year - 1)
+        return dt
+    return None
+
+
+def scan_oom_events(pattern: str, time_start: datetime | None, time_end: datetime | None):
+    """Collect OOM kill events from syslog. A single OOM produces several kernel
+    lines ('invoked oom-killer', 'Out of memory: Killed process', 'oom_reaper');
+    dedupe on (process, minute) so each kill is counted once."""
+    events = []
+    seen = set()
+    files = sorted(glob.glob(pattern))
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    for fp in files:
+        for line in iter_log_lines(Path(fp)):
+            m = OOM_KILLED_RE.search(line) or OOM_REAPED_RE.search(line)
+            if not m:
+                continue
+            dt = parse_syslog_timestamp(line, now)
+            if dt is None or not in_time_window(dt, time_start, time_end):
+                continue
+            process = m.group(1)
+            key = (process, dt.strftime("%Y-%m-%d %H:%M"))
+            if key in seen:
+                continue
+            seen.add(key)
+            events.append({"dt": dt, "process": process})
+    events.sort(key=lambda e: e["dt"])
+    return events, files
+
+
+def cluster_events(events, gap_seconds: int):
+    clusters = []
+    current = []
+    for e in events:
+        if current and (e["dt"] - current[-1]["dt"]).total_seconds() > gap_seconds:
+            clusters.append(current)
+            current = []
+        current.append(e)
+    if current:
+        clusters.append(current)
+    return clusters
+
+
+def analyze_fpm_breaches(events, log_files):
+    pools = Counter(e["pool"] for e in events)
+    pool_limits = {}
+    for e in events:
+        pool_limits[e["pool"]] = e["limit"]
+
+    per_hour = Counter(e["dt"].strftime("%d/%b/%Y:%H") for e in events)
+    per_hour_sorted = sorted(
+        per_hour.items(),
+        key=lambda kv: datetime.strptime(kv[0], "%d/%b/%Y:%H"),
+    )
+
+    incidents = []
+    for pool in pools:
+        pool_events = [e for e in events if e["pool"] == pool]
+        for c in cluster_events(pool_events, FPM_CLUSTER_GAP_SECONDS):
+            start, end = c[0]["dt"], c[-1]["dt"]
+            incidents.append(
+                {
+                    "_start_dt": start,
+                    "pool": pool,
+                    "type": "burst" if len(c) > 1 else "isolated",
+                    "start": start.strftime(EVENT_TS_FMT),
+                    "end": end.strftime(EVENT_TS_FMT),
+                    "duration_seconds": int((end - start).total_seconds()),
+                    "breach_count": len(c),
+                }
+            )
+    incidents.sort(key=lambda i: i["_start_dt"])
+    top_surges = sorted(incidents, key=lambda i: i["breach_count"], reverse=True)[:5]
+    top_surges = [{k: v for k, v in i.items() if k != "_start_dt"} for i in top_surges]
+    incidents = [{k: v for k, v in i.items() if k != "_start_dt"} for i in incidents]
+
+    return {
+        "log_files_scanned": log_files,
+        "total_breaches": len(events),
+        "pools_affected": len(pools),
+        "most_common_pool": pools.most_common(1)[0][0] if pools else "",
+        "breaches_per_pool": [[p, c] for p, c in pools.most_common()],
+        "pool_limits": pool_limits,
+        "breaches_per_hour": [[k, v] for k, v in per_hour_sorted],
+        "cluster_gap_seconds": FPM_CLUSTER_GAP_SECONDS,
+        "incident_count": len(incidents),
+        "burst_incidents": sum(1 for i in incidents if i["type"] == "burst"),
+        "isolated_incidents": sum(1 for i in incidents if i["type"] == "isolated"),
+        "incidents": incidents[:50],
+        "top_surges": top_surges,
+    }
+
+
+def analyze_oom_events(events, log_files):
+    clusters = []
+    for c in cluster_events(events, OOM_CLUSTER_GAP_SECONDS):
+        if len(c) < 2:
+            continue
+        start, end = c[0]["dt"], c[-1]["dt"]
+        clusters.append(
+            {
+                "start": start.strftime(EVENT_TS_FMT),
+                "end": end.strftime(EVENT_TS_FMT),
+                "duration_seconds": int((end - start).total_seconds()),
+                "kill_count": len(c),
+            }
+        )
+    return {
+        "log_files_scanned": log_files,
+        "oom_kill_count": len(events),
+        "killed_processes": [[p, c] for p, c in Counter(e["process"] for e in events).most_common()],
+        "timestamps": [e["dt"].strftime(EVENT_TS_FMT) for e in events][:100],
+        "cluster_gap_seconds": OOM_CLUSTER_GAP_SECONDS,
+        "clusters": clusters,
+    }
 
 
 class GeoResolver:
@@ -698,7 +874,88 @@ def describe_time_window(time_start: datetime | None, time_end: datetime | None,
     return "all available log data"
 
 
-def render_report(top5, all_sorted, roots, geo_backend, out_json_path, only_app: str = "", time_window_desc: str = ""):
+def render_fpm_oom_section(fpm: dict | None, oom: dict | None, only_app: str = "") -> list[str]:
+    out = []
+    out.append("=" * 80)
+    out.append("PHP-FPM max_children Breaches & OOM Events (server logs)")
+    if only_app:
+        out.append(f"(FPM breaches filtered to pool: {only_app})")
+
+    out.append("\nFPM max_children breaches:")
+    if fpm is None:
+        out.append("  - Skipped")
+    elif not fpm["log_files_scanned"]:
+        out.append("  - No FPM log files found/readable")
+    elif not fpm["total_breaches"]:
+        out.append("  - No breaches found")
+    else:
+        out.append(
+            f"  Total breaches: {fpm['total_breaches']} across {fpm['pools_affected']} pool(s), "
+            f"{fpm['incident_count']} incidents ({fpm['burst_incidents']} burst / {fpm['isolated_incidents']} isolated)"
+        )
+        if fpm["most_common_pool"]:
+            mc = fpm["most_common_pool"]
+            mc_count = dict((p, c) for p, c in fpm["breaches_per_pool"]).get(mc, 0)
+            out.append(
+                f"  Most affected pool: {mc} ({mc_count} breaches, "
+                f"pm.max_children={fpm['pool_limits'].get(mc, '?')})"
+            )
+        out.append("  Breaches per pool:")
+        for pool, cnt in fpm["breaches_per_pool"]:
+            out.append(f"    - {pool}: {cnt} (pm.max_children={fpm['pool_limits'].get(pool, '?')})")
+        out.append("  Breaches per hour:")
+        out.append(f"    {'Hour':<20}{'Breaches':>10}")
+        for hour, cnt in fpm["breaches_per_hour"]:
+            out.append(f"    {hour:<20}{cnt:>10}")
+        out.append(f"  Top surges (clustered within {fpm['cluster_gap_seconds']}s):")
+        for inc in fpm["top_surges"]:
+            out.append(
+                f"    - [{inc['type']}] pool {inc['pool']}: {inc['start']} -> {inc['end']} "
+                f"({inc['breach_count']} breaches in {inc['duration_seconds']}s)"
+            )
+
+    out.append("\nOOM killer events (syslog):")
+    if oom is None:
+        out.append("  - Skipped")
+    elif not oom["log_files_scanned"]:
+        out.append("  - No syslog files found/readable")
+    elif not oom["oom_kill_count"]:
+        out.append("  - No OOM kills found")
+    else:
+        out.append(f"  Total OOM kills: {oom['oom_kill_count']}")
+        out.append(
+            "  Killed processes: "
+            + ", ".join(f"{p} ({c})" for p, c in oom["killed_processes"])
+        )
+        out.append("  Kill timestamps:")
+        for ts in oom["timestamps"][:20]:
+            out.append(f"    - {ts}")
+        if len(oom["timestamps"]) > 20:
+            out.append(f"    ... and {oom['oom_kill_count'] - 20} more")
+        if oom["clusters"]:
+            out.append(f"  Clustered kills (within {oom['cluster_gap_seconds']}s of each other):")
+            for c in oom["clusters"]:
+                out.append(
+                    f"    - {c['start']} -> {c['end']} ({c['kill_count']} kills in {c['duration_seconds']}s)"
+                )
+        else:
+            out.append("  Clustered kills: none (no kills close together)")
+
+    out.append("")
+    return out
+
+
+def render_report(
+    top5,
+    all_sorted,
+    roots,
+    geo_backend,
+    out_json_path,
+    only_app: str = "",
+    time_window_desc: str = "",
+    fpm_analysis: dict | None = None,
+    oom_analysis: dict | None = None,
+):
     out = []
     out.append("Cloudways Backend Access Traffic Summary")
     out.append(f"Generated: {now_utc_iso()}")
@@ -815,6 +1072,26 @@ def render_report(top5, all_sorted, roots, geo_backend, out_json_path, only_app:
         else:
             out.append("  - No timestamps parsed from logs")
 
+        fpm = row.get("fpm_breaches")
+        if fpm is not None:
+            out.append(f"\nFPM max_children Breaches (pool {row['app']}):")
+            if fpm["total_breaches"]:
+                limit = fpm["pool_limits"].get(row["app"], "?")
+                out.append(
+                    f"  Total: {fpm['total_breaches']} breaches (pm.max_children={limit}), "
+                    f"{fpm['burst_incidents']} burst / {fpm['isolated_incidents']} isolated incidents"
+                )
+                busiest = sorted(fpm["breaches_per_hour"], key=lambda kv: kv[1], reverse=True)[:3]
+                if busiest:
+                    out.append("  Busiest hours: " + ", ".join(f"{h} ({c})" for h, c in busiest))
+                for inc in fpm["top_surges"][:3]:
+                    out.append(
+                        f"  - [{inc['type']}] {inc['start']} -> {inc['end']} "
+                        f"({inc['breach_count']} breaches in {inc['duration_seconds']}s)"
+                    )
+            else:
+                out.append("  - None found in scanned FPM logs")
+
         out.append("\nStatus Breakdown:")
         for code, cnt in row["status_breakdown"]:
             out.append(f"  - {code}: {cnt}")
@@ -827,6 +1104,9 @@ def render_report(top5, all_sorted, roots, geo_backend, out_json_path, only_app:
             out.append(f"Health check log: {hc['log_file']}")
 
         out.append("")
+
+    if fpm_analysis is not None or oom_analysis is not None:
+        out.extend(render_fpm_oom_section(fpm_analysis, oom_analysis, only_app=only_app))
 
     out.append("=" * 80)
     out.append("All applications by traffic")
@@ -910,6 +1190,21 @@ def main():
             "Only analyze the last N hours of traffic (UTC, based on log timestamps). "
             "e.g. --hour 1 = last hour, --hour 12 = last 12 hours. Cannot be combined with --days"
         ),
+    )
+    parser.add_argument(
+        "--skip-fpm-oom",
+        action="store_true",
+        help="Skip PHP-FPM max_children breach and OOM killer analysis",
+    )
+    parser.add_argument(
+        "--fpm-log-glob",
+        default="/var/log/php*log*",
+        help="Glob for PHP-FPM logs incl. rotated .gz (default: /var/log/php*log*)",
+    )
+    parser.add_argument(
+        "--syslog-glob",
+        default="/var/log/syslog*",
+        help="Glob for syslog files incl. rotated .gz (default: /var/log/syslog*)",
     )
     parser.add_argument(
         "--from-time",
@@ -1104,6 +1399,27 @@ def main():
     geo.close()
     progress_log(progress, "Top 5 enrichment complete")
 
+    fpm_analysis = None
+    oom_analysis = None
+    if not args.skip_fpm_oom:
+        progress_log(progress, f"Scanning FPM logs ({args.fpm_log_glob}) for max_children breaches")
+        fpm_events, fpm_files = scan_fpm_breach_logs(args.fpm_log_glob, time_start, time_end)
+        progress_log(progress, f"Found {len(fpm_events)} FPM breach lines in {len(fpm_files)} files")
+        progress_log(progress, f"Scanning syslog ({args.syslog_glob}) for OOM killer events")
+        oom_events, syslog_files = scan_oom_events(args.syslog_glob, time_start, time_end)
+        progress_log(progress, f"Found {len(oom_events)} OOM kill events in {len(syslog_files)} files")
+
+        # Attach each app's own pool breaches to its per-app summary.
+        for row in top5:
+            app_events = [e for e in fpm_events if e["pool"] == row["app"]]
+            row["fpm_breaches"] = analyze_fpm_breaches(app_events, fpm_files)
+
+        server_events = fpm_events
+        if args.only_app:
+            server_events = [e for e in fpm_events if e["pool"] == args.only_app]
+        fpm_analysis = analyze_fpm_breaches(server_events, fpm_files)
+        oom_analysis = analyze_oom_events(oom_events, syslog_files)
+
     if not args.skip_health:
         progress_log(progress, "Starting health checks for top 5 applications")
         for row in top5:
@@ -1141,6 +1457,8 @@ def main():
         "time_window": time_window_desc,
         "time_window_start_utc": time_start.isoformat() if time_start else "",
         "time_window_end_utc": time_end.isoformat() if time_end else "",
+        "fpm_breach_analysis": fpm_analysis,
+        "oom_analysis": oom_analysis,
         "total_applications_found": len(ranked_apps),
         "top5": top5,
         "all_applications_sorted": [
@@ -1158,6 +1476,8 @@ def main():
         args.output_json,
         only_app=args.only_app,
         time_window_desc=time_window_desc,
+        fpm_analysis=fpm_analysis,
+        oom_analysis=oom_analysis,
     )
     Path(args.output_txt).write_text(report_txt, encoding="utf-8")
 

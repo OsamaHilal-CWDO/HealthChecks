@@ -551,6 +551,31 @@ def build_report_html(traffic: dict, health_by_app: Dict[str, dict], output_path
             )
             out.append(render_top_table("Top Query Parameters", qs.get("top_parameters", []), "Parameter", "Hits"))
 
+        fpm = app.get("fpm_breaches") or {}
+        if fpm:
+            limit = (fpm.get("pool_limits") or {}).get(name, "?")
+            out.append(
+                render_kv_table(
+                    f"FPM max_children Breaches (pool {name})",
+                    [
+                        ("Total breaches", f"{fpm.get('total_breaches', 0)} (pm.max_children={limit})"),
+                        (
+                            "Incidents",
+                            f"{fpm.get('burst_incidents', 0)} burst / {fpm.get('isolated_incidents', 0)} isolated",
+                        ),
+                        (
+                            "Top surge",
+                            (
+                                f"{fpm['top_surges'][0]['start']} -> {fpm['top_surges'][0]['end']} "
+                                f"({fpm['top_surges'][0]['breach_count']} breaches)"
+                                if fpm.get("top_surges")
+                                else "None"
+                            ),
+                        ),
+                    ],
+                )
+            )
+
         hourly = app.get("hourly_traffic", []) or []
         if hourly:
             out.append("<table><tr><th colspan='6'>Hourly Traffic (requests/minute + unique IPs)</th></tr>")
@@ -650,6 +675,67 @@ def build_report_html(traffic: dict, health_by_app: Dict[str, dict], output_path
             "<tr><td>[Add observation]</td><td>[High/Med/Low]</td><td>[Name]</td><td>[Date]</td><td>[Open/In Progress/Done]</td></tr></table>"
         )
 
+    fpm = traffic.get("fpm_breach_analysis") or {}
+    oom = traffic.get("oom_analysis") or {}
+    if fpm or oom:
+        out.append("<h2>PHP-FPM max_children Breaches &amp; OOM Events (server logs)</h2>")
+    if fpm:
+        out.append(
+            render_kv_table(
+                "FPM Breach Overview",
+                [
+                    ("Total breaches", str(fpm.get("total_breaches", 0))),
+                    ("Pools affected", str(fpm.get("pools_affected", 0))),
+                    ("Most affected pool", str(fpm.get("most_common_pool", "") or "N/A")),
+                    (
+                        "Incidents",
+                        f"{fpm.get('incident_count', 0)} total "
+                        f"({fpm.get('burst_incidents', 0)} burst / {fpm.get('isolated_incidents', 0)} isolated)",
+                    ),
+                ],
+            )
+        )
+        out.append(render_top_table("FPM Breaches per Pool", fpm.get("breaches_per_pool", []), "Pool", "Breaches"))
+        out.append(render_top_table("FPM Breaches per Hour", fpm.get("breaches_per_hour", []), "Hour", "Breaches"))
+        surges = fpm.get("top_surges", [])
+        out.append("<table><tr><th colspan='5'>Top FPM Breach Surges (clustered)</th></tr>")
+        out.append("<tr><th>Type</th><th>Pool</th><th>Start</th><th>End</th><th>Breaches</th></tr>")
+        if not surges:
+            out.append("<tr><td colspan='5'>N/A</td></tr>")
+        else:
+            for s in surges:
+                out.append(
+                    "<tr>"
+                    f"<td>{html.escape(str(s.get('type', '')))}</td>"
+                    f"<td>{html.escape(str(s.get('pool', '')))}</td>"
+                    f"<td>{html.escape(str(s.get('start', '')))}</td>"
+                    f"<td>{html.escape(str(s.get('end', '')))}</td>"
+                    f"<td>{html.escape(str(s.get('breach_count', '')))}</td>"
+                    "</tr>"
+                )
+        out.append("</table>")
+    if oom:
+        out.append(
+            render_kv_table(
+                "OOM Killer Overview",
+                [
+                    ("Total OOM kills", str(oom.get("oom_kill_count", 0))),
+                    (
+                        "Killed processes",
+                        ", ".join(f"{p} ({c})" for p, c in oom.get("killed_processes", [])) or "None",
+                    ),
+                    (
+                        "Clustered kills",
+                        "; ".join(
+                            f"{c.get('start')} -> {c.get('end')} ({c.get('kill_count')} kills)"
+                            for c in oom.get("clusters", [])
+                        )
+                        or "None",
+                    ),
+                ],
+            )
+        )
+
     out.append("<h2>All Applications by Traffic</h2>")
     out.append("<table><tr><th>Rank</th><th>App</th><th>Total Requests</th></tr>")
     for i, row in enumerate(all_sorted, 1):
@@ -716,6 +802,13 @@ def build_reference_csv(top5: List[dict], health_by_app: Dict[str, dict], output
             qs = app.get("query_string_analysis", {}) or {}
             for k, v in qs.get("top_parameters", []) or []:
                 w.writerow([name, "query_string_top_parameters", str(k), str(v)])
+            fpm = app.get("fpm_breaches") or {}
+            if fpm:
+                w.writerow([name, "fpm_breaches", "total_breaches", fpm.get("total_breaches", "")])
+                w.writerow([name, "fpm_breaches", "burst_incidents", fpm.get("burst_incidents", "")])
+                w.writerow([name, "fpm_breaches", "isolated_incidents", fpm.get("isolated_incidents", "")])
+                for hour, cnt in fpm.get("breaches_per_hour", []) or []:
+                    w.writerow([name, "fpm_breaches_per_hour", str(hour), str(cnt)])
             for h in app.get("hourly_traffic", []) or []:
                 w.writerow(
                     [

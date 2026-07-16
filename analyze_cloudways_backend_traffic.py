@@ -878,6 +878,9 @@ def render_fpm_oom_section(fpm: dict | None, oom: dict | None, only_app: str = "
     out = []
     out.append("=" * 80)
     out.append("PHP-FPM max_children Breaches & OOM Events (server logs)")
+    window = (fpm or oom or {}).get("time_window", "")
+    if window:
+        out.append(f"Time window: {window}")
     if only_app:
         out.append(f"(FPM breaches filtered to pool: {only_app})")
 
@@ -1402,11 +1405,24 @@ def main():
     fpm_analysis = None
     oom_analysis = None
     if not args.skip_fpm_oom:
-        progress_log(progress, f"Scanning FPM logs ({args.fpm_log_glob}) for max_children breaches")
-        fpm_events, fpm_files = scan_fpm_breach_logs(args.fpm_log_glob, time_start, time_end)
+        # --days limits which rotated *app log files* are read, but FPM/syslog files
+        # span months. Translate --days N into a timestamp cutoff (last N*24h) so
+        # the FPM/OOM scan honors the same period; --hour/--from-time/--to-time
+        # already provide explicit bounds via time_start/time_end.
+        fpm_time_start, fpm_time_end = time_start, time_end
+        fpm_window_desc = time_window_desc
+        if args.days is not None and time_start is None and time_end is None:
+            fpm_time_start = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=args.days)
+            fpm_window_desc = f"last {args.days} day(s) (since {fpm_time_start:%d/%b/%Y %H:%M} UTC)"
+
+        progress_log(
+            progress,
+            f"Scanning FPM logs ({args.fpm_log_glob}) for max_children breaches, window: {fpm_window_desc}",
+        )
+        fpm_events, fpm_files = scan_fpm_breach_logs(args.fpm_log_glob, fpm_time_start, fpm_time_end)
         progress_log(progress, f"Found {len(fpm_events)} FPM breach lines in {len(fpm_files)} files")
         progress_log(progress, f"Scanning syslog ({args.syslog_glob}) for OOM killer events")
-        oom_events, syslog_files = scan_oom_events(args.syslog_glob, time_start, time_end)
+        oom_events, syslog_files = scan_oom_events(args.syslog_glob, fpm_time_start, fpm_time_end)
         progress_log(progress, f"Found {len(oom_events)} OOM kill events in {len(syslog_files)} files")
 
         # Attach each app's own pool breaches to its per-app summary.
@@ -1418,7 +1434,9 @@ def main():
         if args.only_app:
             server_events = [e for e in fpm_events if e["pool"] == args.only_app]
         fpm_analysis = analyze_fpm_breaches(server_events, fpm_files)
+        fpm_analysis["time_window"] = fpm_window_desc
         oom_analysis = analyze_oom_events(oom_events, syslog_files)
+        oom_analysis["time_window"] = fpm_window_desc
 
     if not args.skip_health:
         progress_log(progress, "Starting health checks for top 5 applications")

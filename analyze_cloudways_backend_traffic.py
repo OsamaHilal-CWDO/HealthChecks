@@ -240,11 +240,31 @@ OOM_CLUSTER_GAP_SECONDS = 600
 EVENT_TS_FMT = "%d/%b/%Y %H:%M:%S"
 
 
+def files_touching_window(files, time_start: datetime | None):
+    """Drop files last modified before the window start: a log file cannot
+    contain lines newer than its mtime, so those can be skipped entirely."""
+    if time_start is None:
+        return list(files)
+    cutoff = time_start.replace(tzinfo=timezone.utc).timestamp()
+    kept = []
+    for fp in files:
+        try:
+            if Path(fp).stat().st_mtime < cutoff:
+                continue
+        except OSError:
+            pass
+        kept.append(fp)
+    return kept
+
+
 def scan_fpm_breach_logs(pattern: str, time_start: datetime | None, time_end: datetime | None):
     events = []
-    files = sorted(glob.glob(pattern))
+    files = files_touching_window(sorted(glob.glob(pattern)), time_start)
     for fp in files:
         for line in iter_log_lines(Path(fp)):
+            # Cheap substring check before the (much slower) regex.
+            if "max_children" not in line:
+                continue
             m = FPM_BREACH_RE.search(line)
             if not m:
                 continue
@@ -293,10 +313,13 @@ def scan_oom_events(pattern: str, time_start: datetime | None, time_end: datetim
     dedupe on (process, minute) so each kill is counted once."""
     events = []
     seen = set()
-    files = sorted(glob.glob(pattern))
+    files = files_touching_window(sorted(glob.glob(pattern)), time_start)
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     for fp in files:
         for line in iter_log_lines(Path(fp)):
+            # Cheap substring check before the (much slower) regexes.
+            if "Out of memory" not in line and "oom_reaper" not in line:
+                continue
             m = OOM_KILLED_RE.search(line) or OOM_REAPED_RE.search(line)
             if not m:
                 continue

@@ -512,6 +512,140 @@ def analyze_oom_events(events, log_files):
     }
 
 
+# --- WP-Cron / Cloudways Cron Optimizer analysis -------------------------------
+
+WP_CRON_LOG_DAY_RE = re.compile(r"wp-cron\.log(?:\.(\d+)(?:\.gz)?)?$")
+CRON_EVENT_RE = re.compile(r"Executed the cron event '([^']+)' in ([0-9.]+)s")
+CRON_RUN_RE = re.compile(r"Executed a total of (\d+) cron events?")
+CRON_DMY_TS_RE = re.compile(r"(\d{1,2})[-/]([A-Za-z]{3})[-/](\d{4})[ :T](\d{2}):(\d{2}):(\d{2})")
+CRON_ISO_TS_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})")
+CRON_SLOW_EVENT_SECONDS = 10.0
+
+
+def parse_cron_timestamp(line: str) -> datetime | None:
+    m = CRON_DMY_TS_RE.search(line)
+    if m:
+        d, mon, y, hh, mi, ss = m.groups()
+        month = MONTH_NUM.get(mon.capitalize())
+        if month:
+            try:
+                return datetime(int(y), month, int(d), int(hh), int(mi), int(ss))
+            except ValueError:
+                pass
+    m = CRON_ISO_TS_RE.search(line)
+    if m:
+        y, mo, d, hh, mi, ss = (int(x) for x in m.groups())
+        try:
+            return datetime(y, mo, d, hh, mi, ss)
+        except ValueError:
+            pass
+    return None
+
+
+def wp_cron_log_day_slot(path: Path) -> int:
+    m = WP_CRON_LOG_DAY_RE.search(path.name)
+    if not m:
+        return 999999
+    return 1 if m.group(1) is None else int(m.group(1)) + 1
+
+
+def scan_wp_cron_logs(app_dir: Path, days: int | None, time_start: datetime | None, time_end: datetime | None):
+    """Parse an app's wp-cron.log* (Cloudways Cron Optimizer / WP-CLI output).
+    Returns None when the app has no cron logs at all, so callers can omit it."""
+    logs_dir = app_dir / "logs"
+    try:
+        files = [f for f in logs_dir.glob("wp-cron.log*") if f.is_file()]
+    except OSError:
+        return None
+    if not files:
+        return None
+
+    files = sorted(files, key=wp_cron_log_day_slot)
+    if days is not None:
+        files = [f for f in files if wp_cron_log_day_slot(f) <= days]
+    files = files_touching_window(files, time_start)
+
+    runs = 0
+    events = 0
+    total_time = 0.0
+    over_slow = 0
+    hooks = Counter()
+    slowest = []
+    time_filtered = time_start is not None or time_end is not None
+
+    for f in files:
+        # Event lines may lack their own timestamp; carry the last one seen.
+        current_ts = None
+        for line in iter_log_lines(Path(f)):
+            ts = parse_cron_timestamp(line)
+            if ts is not None:
+                current_ts = ts
+            if time_filtered and current_ts is not None and not in_time_window(current_ts, time_start, time_end):
+                continue
+            m = CRON_EVENT_RE.search(line)
+            if m:
+                hook = m.group(1)
+                try:
+                    dur = float(m.group(2))
+                except ValueError:
+                    continue
+                events += 1
+                total_time += dur
+                hooks[hook] += 1
+                if dur > CRON_SLOW_EVENT_SECONDS:
+                    over_slow += 1
+                slowest.append((dur, hook, current_ts))
+            elif CRON_RUN_RE.search(line):
+                runs += 1
+
+    slowest.sort(key=lambda x: x[0], reverse=True)
+    return {
+        "enabled": True,
+        "log_files_scanned": len(files),
+        "runs": runs,
+        "executed_events": events,
+        "event_time_seconds": round(total_time, 3),
+        "events_over_10s": over_slow,
+        "top_hooks": hooks.most_common(10),
+        "slowest_events": [
+            {
+                "hook": h,
+                "duration_seconds": round(d, 3),
+                "at": ts.strftime(EVENT_TS_FMT) if ts else "",
+            }
+            for d, h, ts in slowest[:10]
+        ],
+    }
+
+
+def analyze_wp_cron(app_stats: dict):
+    rows = sorted(app_stats.items(), key=lambda kv: kv[1]["event_time_seconds"], reverse=True)
+    slow_all = []
+    for app, s in app_stats.items():
+        for ev in s["slowest_events"]:
+            slow_all.append({"app": app, **ev})
+    slow_all.sort(key=lambda e: e["duration_seconds"], reverse=True)
+    return {
+        "log_files_scanned": sum(s["log_files_scanned"] for s in app_stats.values()),
+        "apps_with_cron_logs": len(app_stats),
+        "total_runs": sum(s["runs"] for s in app_stats.values()),
+        "total_executed_events": sum(s["executed_events"] for s in app_stats.values()),
+        "total_event_time_seconds": round(sum(s["event_time_seconds"] for s in app_stats.values()), 3),
+        "top_apps_by_event_time": [
+            {
+                "app": app,
+                "runs": s["runs"],
+                "events": s["executed_events"],
+                "event_time_seconds": s["event_time_seconds"],
+                "events_over_10s": s["events_over_10s"],
+            }
+            for app, s in rows[:10]
+        ],
+        "slowest_events": slow_all[:15],
+        "top_hooks_by_app": [[app, s["top_hooks"][:8]] for app, s in rows[:10]],
+    }
+
+
 class GeoResolver:
     def __init__(
         self,
@@ -986,6 +1120,43 @@ def describe_time_window(time_start: datetime | None, time_end: datetime | None,
     return "all available log data"
 
 
+def render_wp_cron_section(cron: dict) -> list[str]:
+    out = []
+    out.append("=" * 80)
+    out.append("WP-Cron / Cloudways Cron Optimizer Analysis")
+    if cron.get("time_window"):
+        out.append(f"Time window: {cron['time_window']}")
+    out.append(f"Log files scanned: {cron['log_files_scanned']}")
+    out.append(f"Applications with Cron logs: {cron['apps_with_cron_logs']}")
+    out.append(f"Total Cron runs: {cron['total_runs']}")
+    out.append(f"Total executed events: {cron['total_executed_events']}")
+    out.append(f"Total event execution time: {cron['total_event_time_seconds']}s")
+    out.append("")
+    out.append("Top applications by cumulative event execution time:")
+    out.append(f"  {'App':<24}{'Runs':>7}{'Events':>9}{'Event time':>13}{'>10s':>7}")
+    for r in cron["top_apps_by_event_time"]:
+        out.append(
+            f"  {r['app']:<24}{r['runs']:>7}{r['events']:>9}"
+            f"{r['event_time_seconds']:>13.3f}{r['events_over_10s']:>7}"
+        )
+    out.append("")
+    out.append("Slowest individual Cron events:")
+    for ev in cron["slowest_events"]:
+        at = f" ({ev['at']})" if ev.get("at") else ""
+        out.append(f"  - {ev['app']}: {ev['hook']} = {ev['duration_seconds']}s{at}")
+    out.append("")
+    out.append("Most frequent hooks by application:")
+    for app, hooks in cron["top_hooks_by_app"]:
+        out.append("  - " + app + ": " + ", ".join(f"{h} ({c})" for h, c in hooks))
+    out.append("")
+    out.append(
+        "Note: event execution time is the sum of WP-CLI reported event durations; "
+        "it is not total wall-clock run time."
+    )
+    out.append("")
+    return out
+
+
 def render_fpm_oom_section(fpm: dict | None, oom: dict | None, only_app: str = "") -> list[str]:
     out = []
     out.append("=" * 80)
@@ -1070,6 +1241,7 @@ def render_report(
     time_window_desc: str = "",
     fpm_analysis: dict | None = None,
     oom_analysis: dict | None = None,
+    wp_cron_analysis: dict | None = None,
 ):
     out = []
     out.append("Cloudways Backend Access Traffic Summary")
@@ -1207,6 +1379,21 @@ def render_report(
             else:
                 out.append("  - None found in scanned FPM logs")
 
+        cron = row.get("wp_cron")
+        if cron:
+            out.append("\nWP-Cron (Cloudways Cron Optimizer): enabled")
+            out.append(
+                f"  Cron runs: {cron['runs']}, executed events: {cron['executed_events']}, "
+                f"event time: {cron['event_time_seconds']}s, events >10s: {cron['events_over_10s']}"
+            )
+            if cron["top_hooks"]:
+                out.append("  Top hooks: " + ", ".join(f"{h} ({c})" for h, c in cron["top_hooks"][:8]))
+            if cron["slowest_events"]:
+                out.append("  Slowest events:")
+                for ev in cron["slowest_events"][:5]:
+                    at = f" ({ev['at']})" if ev.get("at") else ""
+                    out.append(f"    - {ev['hook']} = {ev['duration_seconds']}s{at}")
+
         out.append("\nStatus Breakdown:")
         for code, cnt in row["status_breakdown"]:
             out.append(f"  - {code}: {cnt}")
@@ -1219,6 +1406,9 @@ def render_report(
             out.append(f"Health check log: {hc['log_file']}")
 
         out.append("")
+
+    if wp_cron_analysis is not None:
+        out.extend(render_wp_cron_section(wp_cron_analysis))
 
     if fpm_analysis is not None or oom_analysis is not None:
         out.extend(render_fpm_oom_section(fpm_analysis, oom_analysis, only_app=only_app))
@@ -1515,6 +1705,22 @@ def main():
     geo.close()
     progress_log(progress, "Top 5 enrichment complete")
 
+    # WP-Cron / Cloudways Cron Optimizer: parse each app's wp-cron.log* if present.
+    # Apps without cron logs are omitted entirely (no cron optimizer configured).
+    progress_log(progress, "Scanning wp-cron logs (Cloudways Cron Optimizer)")
+    app_cron_stats = {}
+    for app, data in apps.items():
+        stats = scan_wp_cron_logs(Path(str(data["app_dir"])), args.days, time_start, time_end)
+        if stats:
+            app_cron_stats[app] = stats
+    progress_log(progress, f"Cron optimizer logs found for {len(app_cron_stats)}/{len(apps)} applications")
+    wp_cron_analysis = None
+    if app_cron_stats:
+        wp_cron_analysis = analyze_wp_cron(app_cron_stats)
+        wp_cron_analysis["time_window"] = time_window_desc
+    for row in top5:
+        row["wp_cron"] = app_cron_stats.get(row["app"])
+
     fpm_analysis = None
     oom_analysis = None
     if not args.skip_fpm_oom:
@@ -1590,6 +1796,7 @@ def main():
         "time_window_end_utc": time_end.isoformat() if time_end else "",
         "fpm_breach_analysis": fpm_analysis,
         "oom_analysis": oom_analysis,
+        "wp_cron_analysis": wp_cron_analysis,
         "total_applications_found": len(ranked_apps),
         "top5": top5,
         "all_applications_sorted": [
@@ -1609,6 +1816,7 @@ def main():
         time_window_desc=time_window_desc,
         fpm_analysis=fpm_analysis,
         oom_analysis=oom_analysis,
+        wp_cron_analysis=wp_cron_analysis,
     )
     Path(args.output_txt).write_text(report_txt, encoding="utf-8")
 

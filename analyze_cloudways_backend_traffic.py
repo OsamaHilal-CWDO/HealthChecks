@@ -572,16 +572,26 @@ def scan_wp_cron_logs(app_dir: Path, days: int | None, time_start: datetime | No
     hooks = Counter()
     slowest = []
     time_filtered = time_start is not None or time_end is not None
+    window_approximate = False
 
     for f in files:
+        # Cron files are small; buffer so we can check for timestamps first.
+        lines = list(iter_log_lines(Path(f)))
+        has_ts = any(parse_cron_timestamp(line) is not None for line in lines)
+        if time_filtered and not has_ts:
+            # No line timestamps to filter on: fall back to file-level bounds
+            # (rotation slot + mtime) and flag the window as approximate.
+            window_approximate = True
+
         # Event lines may lack their own timestamp; carry the last one seen.
         current_ts = None
-        for line in iter_log_lines(Path(f)):
+        for line in lines:
             ts = parse_cron_timestamp(line)
             if ts is not None:
                 current_ts = ts
-            if time_filtered and current_ts is not None and not in_time_window(current_ts, time_start, time_end):
-                continue
+            if time_filtered and has_ts:
+                if current_ts is None or not in_time_window(current_ts, time_start, time_end):
+                    continue
             m = CRON_EVENT_RE.search(line)
             if m:
                 hook = m.group(1)
@@ -601,6 +611,7 @@ def scan_wp_cron_logs(app_dir: Path, days: int | None, time_start: datetime | No
     slowest.sort(key=lambda x: x[0], reverse=True)
     return {
         "enabled": True,
+        "window_approximate": window_approximate,
         "log_files_scanned": len(files),
         "runs": runs,
         "executed_events": events,
@@ -643,6 +654,9 @@ def analyze_wp_cron(app_stats: dict):
         ],
         "slowest_events": slow_all[:15],
         "top_hooks_by_app": [[app, s["top_hooks"][:8]] for app, s in rows[:10]],
+        "apps_window_approximate": sorted(
+            app for app, s in app_stats.items() if s.get("window_approximate")
+        ),
     }
 
 
@@ -1153,6 +1167,12 @@ def render_wp_cron_section(cron: dict) -> list[str]:
         "Note: event execution time is the sum of WP-CLI reported event durations; "
         "it is not total wall-clock run time."
     )
+    approx = cron.get("apps_window_approximate") or []
+    if approx:
+        out.append(
+            "Note: cron log lines for these apps carry no timestamps, so the time window "
+            "was approximated by log rotation/mtime only: " + ", ".join(approx)
+        )
     out.append("")
     return out
 
@@ -1386,6 +1406,10 @@ def render_report(
                 f"  Cron runs: {cron['runs']}, executed events: {cron['executed_events']}, "
                 f"event time: {cron['event_time_seconds']}s, events >10s: {cron['events_over_10s']}"
             )
+            if cron.get("window_approximate"):
+                out.append(
+                    "  (log lines carry no timestamps; time window approximated by log rotation/mtime)"
+                )
             if cron["top_hooks"]:
                 out.append("  Top hooks: " + ", ".join(f"{h} ({c})" for h, c in cron["top_hooks"][:8]))
             if cron["slowest_events"]:

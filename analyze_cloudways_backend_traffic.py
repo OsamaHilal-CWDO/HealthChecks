@@ -519,6 +519,8 @@ CRON_EVENT_RE = re.compile(r"Executed the cron event '([^']+)' in ([0-9.]+)s")
 CRON_RUN_RE = re.compile(r"Executed a total of (\d+) cron events?")
 CRON_DMY_TS_RE = re.compile(r"(\d{1,2})[-/]([A-Za-z]{3})[-/](\d{4})[ :T](\d{2}):(\d{2}):(\d{2})")
 CRON_ISO_TS_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})")
+# Cloudways cron wrapper headers use `date` output: "Thu Sep 17 10:45:18 UTC 2026"
+CRON_UNIX_TS_RE = re.compile(r"[A-Za-z]{3}\s+([A-Za-z]{3})\s+(\d{1,2})\s+(\d{2}):(\d{2}):(\d{2})\s+\w+\s+(\d{4})")
 CRON_SLOW_EVENT_SECONDS = 10.0
 
 
@@ -526,6 +528,15 @@ def parse_cron_timestamp(line: str) -> datetime | None:
     m = CRON_DMY_TS_RE.search(line)
     if m:
         d, mon, y, hh, mi, ss = m.groups()
+        month = MONTH_NUM.get(mon.capitalize())
+        if month:
+            try:
+                return datetime(int(y), month, int(d), int(hh), int(mi), int(ss))
+            except ValueError:
+                pass
+    m = CRON_UNIX_TS_RE.search(line)
+    if m:
+        mon, d, hh, mi, ss, y = m.groups()
         month = MONTH_NUM.get(mon.capitalize())
         if month:
             try:

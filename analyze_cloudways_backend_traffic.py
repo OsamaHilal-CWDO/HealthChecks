@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import glob
 import gzip
 import ipaddress
 import json
@@ -9,17 +10,119 @@ import re
 import shutil
 import subprocess
 import sys
-from collections import Counter
-from datetime import datetime, timezone
+from collections import Counter, defaultdict
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse
 
 BROWSER_UA_MARKERS = ("mozilla", "chrome", "chromium", "safari")
 REQUEST_RE = re.compile(r'"([A-Z]+)\s+([^\s"]+)\s+HTTP/[0-9.]+"')
 STATUS_RE = re.compile(r'"\s+(\d{3})\s+')
 IP_RE = re.compile(r'^(\S+)\s')
+TIME_RE = re.compile(r"\[(\d{2})/([A-Za-z]{3})/(\d{4}):(\d{2}):(\d{2}):(\d{2})\s")
 BACKEND_LOG_DAY_RE = re.compile(r"\.access\.log(?:\.(\d+)(?:\.gz)?)?$")
+
+MONTH_NUM = {
+    "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
+    "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
+}
+
+# Matches desktop Chrome, mobile Chrome on iOS (CriOS) and raw Chromium builds.
+CHROME_VERSION_RE = re.compile(r"(?:chrome|crios|chromium)/(\d+)", re.IGNORECASE)
+# Chrome 126 shipped on 2024-06-11; majors advance roughly every ~40 days.
+# Used only to *estimate* the newest plausible major when no override is given.
+CHROME_REFERENCE_MAJOR = 126
+CHROME_REFERENCE_DATE = datetime(2024, 6, 11, tzinfo=timezone.utc)
+CHROME_DAYS_PER_MAJOR = 40.5
+
+# ISO 3166-1 alpha-2 -> country name, used to label GeoIP results as
+# "United States (US)". Unmapped codes fall back to the bare code.
+COUNTRY_NAMES = {
+    "AD": "Andorra", "AE": "United Arab Emirates", "AF": "Afghanistan",
+    "AG": "Antigua and Barbuda", "AI": "Anguilla", "AL": "Albania",
+    "AM": "Armenia", "AO": "Angola", "AQ": "Antarctica", "AR": "Argentina",
+    "AS": "American Samoa", "AT": "Austria", "AU": "Australia",
+    "AW": "Aruba", "AX": "Aland Islands", "AZ": "Azerbaijan",
+    "BA": "Bosnia and Herzegovina", "BB": "Barbados", "BD": "Bangladesh",
+    "BE": "Belgium", "BF": "Burkina Faso", "BG": "Bulgaria", "BH": "Bahrain",
+    "BI": "Burundi", "BJ": "Benin", "BL": "Saint Barthelemy", "BM": "Bermuda",
+    "BN": "Brunei", "BO": "Bolivia", "BQ": "Bonaire", "BR": "Brazil",
+    "BS": "Bahamas", "BT": "Bhutan", "BV": "Bouvet Island", "BW": "Botswana",
+    "BY": "Belarus", "BZ": "Belize", "CA": "Canada", "CC": "Cocos Islands",
+    "CD": "DR Congo", "CF": "Central African Republic", "CG": "Congo",
+    "CH": "Switzerland", "CI": "Ivory Coast", "CK": "Cook Islands",
+    "CL": "Chile", "CM": "Cameroon", "CN": "China", "CO": "Colombia",
+    "CR": "Costa Rica", "CU": "Cuba", "CV": "Cape Verde", "CW": "Curacao",
+    "CX": "Christmas Island", "CY": "Cyprus", "CZ": "Czechia",
+    "DE": "Germany", "DJ": "Djibouti", "DK": "Denmark", "DM": "Dominica",
+    "DO": "Dominican Republic", "DZ": "Algeria", "EC": "Ecuador",
+    "EE": "Estonia", "EG": "Egypt", "EH": "Western Sahara", "ER": "Eritrea",
+    "ES": "Spain", "ET": "Ethiopia", "FI": "Finland", "FJ": "Fiji",
+    "FK": "Falkland Islands", "FM": "Micronesia", "FO": "Faroe Islands",
+    "FR": "France", "GA": "Gabon", "GB": "United Kingdom", "GD": "Grenada",
+    "GE": "Georgia", "GF": "French Guiana", "GG": "Guernsey", "GH": "Ghana",
+    "GI": "Gibraltar", "GL": "Greenland", "GM": "Gambia", "GN": "Guinea",
+    "GP": "Guadeloupe", "GQ": "Equatorial Guinea", "GR": "Greece",
+    "GS": "South Georgia", "GT": "Guatemala", "GU": "Guam",
+    "GW": "Guinea-Bissau", "GY": "Guyana", "HK": "Hong Kong",
+    "HM": "Heard Island", "HN": "Honduras", "HR": "Croatia", "HT": "Haiti",
+    "HU": "Hungary", "ID": "Indonesia", "IE": "Ireland", "IL": "Israel",
+    "IM": "Isle of Man", "IN": "India", "IO": "British Indian Ocean Territory",
+    "IQ": "Iraq", "IR": "Iran", "IS": "Iceland", "IT": "Italy",
+    "JE": "Jersey", "JM": "Jamaica", "JO": "Jordan", "JP": "Japan",
+    "KE": "Kenya", "KG": "Kyrgyzstan", "KH": "Cambodia", "KI": "Kiribati",
+    "KM": "Comoros", "KN": "Saint Kitts and Nevis", "KP": "North Korea",
+    "KR": "South Korea", "KW": "Kuwait", "KY": "Cayman Islands",
+    "KZ": "Kazakhstan", "LA": "Laos", "LB": "Lebanon", "LC": "Saint Lucia",
+    "LI": "Liechtenstein", "LK": "Sri Lanka", "LR": "Liberia",
+    "LS": "Lesotho", "LT": "Lithuania", "LU": "Luxembourg", "LV": "Latvia",
+    "LY": "Libya", "MA": "Morocco", "MC": "Monaco", "MD": "Moldova",
+    "ME": "Montenegro", "MF": "Saint Martin", "MG": "Madagascar",
+    "MH": "Marshall Islands", "MK": "North Macedonia", "ML": "Mali",
+    "MM": "Myanmar", "MN": "Mongolia", "MO": "Macao",
+    "MP": "Northern Mariana Islands", "MQ": "Martinique",
+    "MR": "Mauritania", "MS": "Montserrat", "MT": "Malta",
+    "MU": "Mauritius", "MV": "Maldives", "MW": "Malawi", "MX": "Mexico",
+    "MY": "Malaysia", "MZ": "Mozambique", "NA": "Namibia",
+    "NC": "New Caledonia", "NE": "Niger", "NF": "Norfolk Island",
+    "NG": "Nigeria", "NI": "Nicaragua", "NL": "Netherlands", "NO": "Norway",
+    "NP": "Nepal", "NR": "Nauru", "NU": "Niue", "NZ": "New Zealand",
+    "OM": "Oman", "PA": "Panama", "PE": "Peru", "PF": "French Polynesia",
+    "PG": "Papua New Guinea", "PH": "Philippines", "PK": "Pakistan",
+    "PL": "Poland", "PM": "Saint Pierre and Miquelon", "PN": "Pitcairn",
+    "PR": "Puerto Rico", "PS": "Palestine", "PT": "Portugal", "PW": "Palau",
+    "PY": "Paraguay", "QA": "Qatar", "RE": "Reunion", "RO": "Romania",
+    "RS": "Serbia", "RU": "Russia", "RW": "Rwanda", "SA": "Saudi Arabia",
+    "SB": "Solomon Islands", "SC": "Seychelles", "SD": "Sudan",
+    "SE": "Sweden", "SG": "Singapore", "SH": "Saint Helena",
+    "SI": "Slovenia", "SJ": "Svalbard and Jan Mayen", "SK": "Slovakia",
+    "SL": "Sierra Leone", "SM": "San Marino", "SN": "Senegal",
+    "SO": "Somalia", "SR": "Suriname", "SS": "South Sudan",
+    "ST": "Sao Tome and Principe", "SV": "El Salvador",
+    "SX": "Sint Maarten", "SY": "Syria", "SZ": "Eswatini",
+    "TC": "Turks and Caicos Islands", "TD": "Chad",
+    "TF": "French Southern Territories", "TG": "Togo", "TH": "Thailand",
+    "TJ": "Tajikistan", "TK": "Tokelau", "TL": "Timor-Leste",
+    "TM": "Turkmenistan", "TN": "Tunisia", "TO": "Tonga", "TR": "Türkiye",
+    "TT": "Trinidad and Tobago", "TV": "Tuvalu", "TW": "Taiwan",
+    "TZ": "Tanzania", "UA": "Ukraine", "UG": "Uganda",
+    "UM": "US Minor Outlying Islands", "US": "United States",
+    "UY": "Uruguay", "UZ": "Uzbekistan", "VA": "Vatican City",
+    "VC": "Saint Vincent and the Grenadines", "VE": "Venezuela",
+    "VG": "British Virgin Islands", "VI": "US Virgin Islands",
+    "VN": "Vietnam", "VU": "Vanuatu", "WF": "Wallis and Futuna",
+    "WS": "Samoa", "XK": "Kosovo", "YE": "Yemen", "YT": "Mayotte",
+    "ZA": "South Africa", "ZM": "Zambia", "ZW": "Zimbabwe",
+}
+
+
+def country_label(cc: str) -> str:
+    if not cc or cc.upper() == "UNKNOWN":
+        return "Unknown"
+    cc = cc.upper()
+    name = COUNTRY_NAMES.get(cc)
+    return f"{name} ({cc})" if name else cc
 
 
 def now_utc_iso() -> str:
@@ -50,6 +153,9 @@ def parse_log_line(line: str):
     endpoint = "UNKNOWN"
     status = "UNKNOWN"
     user_agent = "UNKNOWN"
+    timestamp = None
+    hour_key = ""
+    minute = -1
 
     m_ip = IP_RE.search(line)
     if m_ip:
@@ -63,50 +169,536 @@ def parse_log_line(line: str):
     if m_status:
         status = m_status.group(1)
 
+    m_time = TIME_RE.search(line)
+    if m_time:
+        day, mon, year, hh, mm, ss = m_time.groups()
+        month = MONTH_NUM.get(mon)
+        if month:
+            try:
+                timestamp = datetime(int(year), month, int(day), int(hh), int(mm), int(ss))
+                hour_key = f"{day}/{mon}/{year}:{hh}"
+                minute = int(mm)
+            except ValueError:
+                timestamp = None
+
     quoted = re.findall(r'"([^"]*)"', line)
     if quoted:
         user_agent = (quoted[-1] or "UNKNOWN").strip() or "UNKNOWN"
 
-    return ip, endpoint, status, user_agent
+    return ip, endpoint, status, user_agent, timestamp, hour_key, minute
+
+
+def parse_line_timestamp(line: str) -> datetime | None:
+    m = TIME_RE.search(line)
+    if not m:
+        return None
+    day, mon, year, hh, mm, ss = m.groups()
+    month = MONTH_NUM.get(mon)
+    if not month:
+        return None
+    try:
+        return datetime(int(year), month, int(day), int(hh), int(mm), int(ss))
+    except ValueError:
+        return None
+
+
+def in_time_window(ts: datetime | None, start: datetime | None, end: datetime | None) -> bool:
+    if start is None and end is None:
+        return True
+    if ts is None:
+        return False
+    if start is not None and ts < start:
+        return False
+    if end is not None and ts > end:
+        return False
+    return True
+
+
+def subnet_for_ip(ip: str) -> str | None:
+    """Aggregate IPv4 into /24 and IPv6 into /48 subnets."""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except Exception:
+        return None
+    prefix = 24 if addr.version == 4 else 48
+    try:
+        return str(ipaddress.ip_network(f"{ip}/{prefix}", strict=False))
+    except Exception:
+        return None
+
+
+def estimate_latest_chrome_major(now: datetime | None = None) -> int:
+    now = now or datetime.now(timezone.utc)
+    days = (now - CHROME_REFERENCE_DATE).days
+    return CHROME_REFERENCE_MAJOR + max(0, int(days / CHROME_DAYS_PER_MAJOR))
+
+
+def analyze_chrome_versions(
+    chrome_majors: Counter,
+    total_requests: int,
+    headless_requests: int,
+    latest_major: int,
+    obsolete_margin: int,
+):
+    claimed = sum(chrome_majors.values())
+    percent = (claimed / total_requests * 100.0) if total_requests else 0.0
+    obsolete_cutoff = latest_major - obsolete_margin
+
+    obsolete = {v: c for v, c in chrome_majors.items() if v <= obsolete_cutoff}
+    nonexistent = {v: c for v, c in chrome_majors.items() if v > latest_major}
+
+    def version_span(versions) -> str:
+        if not versions:
+            return ""
+        lo, hi = min(versions), max(versions)
+        return f"v{lo}" if lo == hi else f"v{lo}-v{hi}"
+
+    return {
+        "claimed_chrome_requests": claimed,
+        "claimed_chrome_percent": round(percent, 2),
+        "distinct_major_versions": len(chrome_majors),
+        "estimated_latest_major": latest_major,
+        "obsolete_cutoff_major": obsolete_cutoff,
+        "top_major_versions": [[f"v{v}", c] for v, c in chrome_majors.most_common(10)],
+        "spoofing_indicators": {
+            "obsolete_versions": {
+                "range": version_span(obsolete),
+                "distinct_versions": len(obsolete),
+                "requests": sum(obsolete.values()),
+            },
+            "nonexistent_versions": {
+                "range": version_span(nonexistent),
+                "distinct_versions": len(nonexistent),
+                "requests": sum(nonexistent.values()),
+            },
+            "headless_chrome_requests": headless_requests,
+        },
+    }
+
+
+def analyze_query_strings(param_hits: Counter, requests_with_query: int, total_requests: int, top_n: int = 25):
+    """Generic parameter frequency: whatever appears after '?' gets counted, no
+    platform-specific assumptions (works for WooCommerce, Magento, custom, etc)."""
+    percent = (requests_with_query / total_requests * 100.0) if total_requests else 0.0
+    return {
+        "requests_with_query_string": requests_with_query,
+        "percent_of_total": round(percent, 2),
+        "distinct_parameters": len(param_hits),
+        "top_parameters": [[k, v] for k, v in param_hits.most_common(top_n)],
+    }
+
+
+def build_hourly_stats(hourly_minute_counts, hourly_ips):
+    rows = []
+    for hour_key, minute_counts in hourly_minute_counts.items():
+        try:
+            sort_key = datetime.strptime(hour_key, "%d/%b/%Y:%H")
+        except ValueError:
+            sort_key = datetime.max
+        counts = list(minute_counts.values())
+        total = sum(counts)
+        rows.append(
+            {
+                "_sort": sort_key,
+                "hour": hour_key,
+                "min_per_minute": min(counts),
+                "avg_per_minute": round(total / len(counts), 1),
+                "max_per_minute": max(counts),
+                "total_requests": total,
+                "unique_ips": len(hourly_ips.get(hour_key, ())),
+            }
+        )
+    rows.sort(key=lambda r: r["_sort"])
+    for r in rows:
+        r.pop("_sort", None)
+    return rows
+
+
+# --- PHP-FPM max_children breach & OOM analysis -------------------------------
+
+FPM_BREACH_RE = re.compile(
+    r"\[(\d{1,2})-([A-Za-z]{3})-(\d{4})\s+(\d{2}):(\d{2}):(\d{2})\]\s+WARNING:\s+\[pool ([^\]]+)\]\s+"
+    r"server reached pm\.max_children setting \((\d+)\)"
+)
+OOM_KILLED_RE = re.compile(r"Out of memory: Killed process \d+ \(([^)]+)\)", re.IGNORECASE)
+OOM_REAPED_RE = re.compile(r"oom_reaper: reaped process \d+ \(([^)]+)\)", re.IGNORECASE)
+SYSLOG_ISO_TS_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})")
+SYSLOG_CLASSIC_TS_RE = re.compile(r"^([A-Za-z]{3})\s+(\d{1,2})\s+(\d{2}):(\d{2}):(\d{2})")
+FPM_CLUSTER_GAP_SECONDS = 120
+OOM_CLUSTER_GAP_SECONDS = 600
+EVENT_TS_FMT = "%d/%b/%Y %H:%M:%S"
+
+
+def files_touching_window(files, time_start: datetime | None):
+    """Drop files last modified before the window start: a log file cannot
+    contain lines newer than its mtime, so those can be skipped entirely."""
+    if time_start is None:
+        return list(files)
+    cutoff = time_start.replace(tzinfo=timezone.utc).timestamp()
+    kept = []
+    for fp in files:
+        try:
+            if Path(fp).stat().st_mtime < cutoff:
+                continue
+        except OSError:
+            pass
+        kept.append(fp)
+    return kept
+
+
+def scan_fpm_breach_logs(pattern: str, time_start: datetime | None, time_end: datetime | None):
+    events = []
+    files = files_touching_window(sorted(glob.glob(pattern)), time_start)
+    for fp in files:
+        for line in iter_log_lines(Path(fp)):
+            # Cheap substring check before the (much slower) regex.
+            if "max_children" not in line:
+                continue
+            m = FPM_BREACH_RE.search(line)
+            if not m:
+                continue
+            day, mon, year, hh, mm, ss, pool, limit = m.groups()
+            month = MONTH_NUM.get(mon)
+            if not month:
+                continue
+            try:
+                dt = datetime(int(year), month, int(day), int(hh), int(mm), int(ss))
+            except ValueError:
+                continue
+            if not in_time_window(dt, time_start, time_end):
+                continue
+            events.append({"dt": dt, "pool": pool.strip(), "limit": int(limit)})
+    events.sort(key=lambda e: e["dt"])
+    return events, files
+
+
+def parse_syslog_timestamp(line: str, now: datetime) -> datetime | None:
+    m = SYSLOG_ISO_TS_RE.match(line)
+    if m:
+        y, mo, d, hh, mm, ss = (int(x) for x in m.groups())
+        try:
+            return datetime(y, mo, d, hh, mm, ss)
+        except ValueError:
+            return None
+    m = SYSLOG_CLASSIC_TS_RE.match(line)
+    if m:
+        month = MONTH_NUM.get(m.group(1))
+        if not month:
+            return None
+        try:
+            dt = datetime(now.year, month, int(m.group(2)), int(m.group(3)), int(m.group(4)), int(m.group(5)))
+        except ValueError:
+            return None
+        # Classic syslog has no year; a "future" date means it was last year.
+        if dt > now + timedelta(days=1):
+            dt = dt.replace(year=now.year - 1)
+        return dt
+    return None
+
+
+def scan_oom_events(pattern: str, time_start: datetime | None, time_end: datetime | None):
+    """Collect OOM kill events from syslog. A single OOM produces several kernel
+    lines ('invoked oom-killer', 'Out of memory: Killed process', 'oom_reaper');
+    dedupe on (process, minute) so each kill is counted once."""
+    events = []
+    seen = set()
+    files = files_touching_window(sorted(glob.glob(pattern)), time_start)
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    for fp in files:
+        for line in iter_log_lines(Path(fp)):
+            # Cheap substring check before the (much slower) regexes.
+            if "Out of memory" not in line and "oom_reaper" not in line:
+                continue
+            m = OOM_KILLED_RE.search(line) or OOM_REAPED_RE.search(line)
+            if not m:
+                continue
+            dt = parse_syslog_timestamp(line, now)
+            if dt is None or not in_time_window(dt, time_start, time_end):
+                continue
+            process = m.group(1)
+            key = (process, dt.strftime("%Y-%m-%d %H:%M"))
+            if key in seen:
+                continue
+            seen.add(key)
+            events.append({"dt": dt, "process": process})
+    events.sort(key=lambda e: e["dt"])
+    return events, files
+
+
+def cluster_events(events, gap_seconds: int):
+    clusters = []
+    current = []
+    for e in events:
+        if current and (e["dt"] - current[-1]["dt"]).total_seconds() > gap_seconds:
+            clusters.append(current)
+            current = []
+        current.append(e)
+    if current:
+        clusters.append(current)
+    return clusters
+
+
+def analyze_fpm_breaches(events, log_files):
+    pools = Counter(e["pool"] for e in events)
+    pool_limits = {}
+    for e in events:
+        pool_limits[e["pool"]] = e["limit"]
+
+    per_hour = Counter(e["dt"].strftime("%d/%b/%Y:%H") for e in events)
+    per_hour_sorted = sorted(
+        per_hour.items(),
+        key=lambda kv: datetime.strptime(kv[0], "%d/%b/%Y:%H"),
+    )
+
+    incidents = []
+    for pool in pools:
+        pool_events = [e for e in events if e["pool"] == pool]
+        for c in cluster_events(pool_events, FPM_CLUSTER_GAP_SECONDS):
+            start, end = c[0]["dt"], c[-1]["dt"]
+            incidents.append(
+                {
+                    "_start_dt": start,
+                    "pool": pool,
+                    "type": "burst" if len(c) > 1 else "isolated",
+                    "start": start.strftime(EVENT_TS_FMT),
+                    "end": end.strftime(EVENT_TS_FMT),
+                    "duration_seconds": int((end - start).total_seconds()),
+                    "breach_count": len(c),
+                }
+            )
+    incidents.sort(key=lambda i: i["_start_dt"])
+    top_surges = sorted(incidents, key=lambda i: i["breach_count"], reverse=True)[:5]
+    top_surges = [{k: v for k, v in i.items() if k != "_start_dt"} for i in top_surges]
+    incidents = [{k: v for k, v in i.items() if k != "_start_dt"} for i in incidents]
+
+    return {
+        "log_files_scanned": log_files,
+        "total_breaches": len(events),
+        "pools_affected": len(pools),
+        "most_common_pool": pools.most_common(1)[0][0] if pools else "",
+        "breaches_per_pool": [[p, c] for p, c in pools.most_common()],
+        "pool_limits": pool_limits,
+        "breaches_per_hour": [[k, v] for k, v in per_hour_sorted],
+        "cluster_gap_seconds": FPM_CLUSTER_GAP_SECONDS,
+        "incident_count": len(incidents),
+        "burst_incidents": sum(1 for i in incidents if i["type"] == "burst"),
+        "isolated_incidents": sum(1 for i in incidents if i["type"] == "isolated"),
+        "incidents": incidents[:50],
+        "top_surges": top_surges,
+    }
+
+
+def analyze_oom_events(events, log_files):
+    clusters = []
+    for c in cluster_events(events, OOM_CLUSTER_GAP_SECONDS):
+        if len(c) < 2:
+            continue
+        start, end = c[0]["dt"], c[-1]["dt"]
+        clusters.append(
+            {
+                "start": start.strftime(EVENT_TS_FMT),
+                "end": end.strftime(EVENT_TS_FMT),
+                "duration_seconds": int((end - start).total_seconds()),
+                "kill_count": len(c),
+            }
+        )
+    return {
+        "log_files_scanned": log_files,
+        "oom_kill_count": len(events),
+        "killed_processes": [[p, c] for p, c in Counter(e["process"] for e in events).most_common()],
+        "timestamps": [e["dt"].strftime(EVENT_TS_FMT) for e in events][:100],
+        "cluster_gap_seconds": OOM_CLUSTER_GAP_SECONDS,
+        "clusters": clusters,
+    }
+
+
+# --- WP-Cron / Cloudways Cron Optimizer analysis -------------------------------
+
+WP_CRON_LOG_DAY_RE = re.compile(r"wp-cron\.log(?:\.(\d+)(?:\.gz)?)?$")
+CRON_EVENT_RE = re.compile(r"Executed the cron event '([^']+)' in ([0-9.]+)s")
+CRON_RUN_RE = re.compile(r"Executed a total of (\d+) cron events?")
+CRON_DMY_TS_RE = re.compile(r"(\d{1,2})[-/]([A-Za-z]{3})[-/](\d{4})[ :T](\d{2}):(\d{2}):(\d{2})")
+CRON_ISO_TS_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})")
+# Cloudways cron wrapper headers use `date` output: "Thu Sep 17 10:45:18 UTC 2026"
+CRON_UNIX_TS_RE = re.compile(r"[A-Za-z]{3}\s+([A-Za-z]{3})\s+(\d{1,2})\s+(\d{2}):(\d{2}):(\d{2})\s+\w+\s+(\d{4})")
+CRON_SLOW_EVENT_SECONDS = 10.0
+
+
+def parse_cron_timestamp(line: str) -> datetime | None:
+    m = CRON_DMY_TS_RE.search(line)
+    if m:
+        d, mon, y, hh, mi, ss = m.groups()
+        month = MONTH_NUM.get(mon.capitalize())
+        if month:
+            try:
+                return datetime(int(y), month, int(d), int(hh), int(mi), int(ss))
+            except ValueError:
+                pass
+    m = CRON_UNIX_TS_RE.search(line)
+    if m:
+        mon, d, hh, mi, ss, y = m.groups()
+        month = MONTH_NUM.get(mon.capitalize())
+        if month:
+            try:
+                return datetime(int(y), month, int(d), int(hh), int(mi), int(ss))
+            except ValueError:
+                pass
+    m = CRON_ISO_TS_RE.search(line)
+    if m:
+        y, mo, d, hh, mi, ss = (int(x) for x in m.groups())
+        try:
+            return datetime(y, mo, d, hh, mi, ss)
+        except ValueError:
+            pass
+    return None
+
+
+def wp_cron_log_day_slot(path: Path) -> int:
+    m = WP_CRON_LOG_DAY_RE.search(path.name)
+    if not m:
+        return 999999
+    return 1 if m.group(1) is None else int(m.group(1)) + 1
+
+
+def scan_wp_cron_logs(app_dir: Path, days: int | None, time_start: datetime | None, time_end: datetime | None):
+    """Parse an app's wp-cron.log* (Cloudways Cron Optimizer / WP-CLI output).
+    Returns None when the app has no cron logs at all, so callers can omit it."""
+    logs_dir = app_dir / "logs"
+    try:
+        files = [f for f in logs_dir.glob("wp-cron.log*") if f.is_file()]
+    except OSError:
+        return None
+    if not files:
+        return None
+
+    files = sorted(files, key=wp_cron_log_day_slot)
+    if days is not None:
+        files = [f for f in files if wp_cron_log_day_slot(f) <= days]
+    files = files_touching_window(files, time_start)
+
+    runs = 0
+    events = 0
+    total_time = 0.0
+    over_slow = 0
+    hooks = Counter()
+    slowest = []
+    time_filtered = time_start is not None or time_end is not None
+    window_approximate = False
+
+    for f in files:
+        # Cron files are small; buffer so we can check for timestamps first.
+        lines = list(iter_log_lines(Path(f)))
+        has_ts = any(parse_cron_timestamp(line) is not None for line in lines)
+        if time_filtered and not has_ts:
+            # No line timestamps to filter on: fall back to file-level bounds
+            # (rotation slot + mtime) and flag the window as approximate.
+            window_approximate = True
+
+        # Event lines may lack their own timestamp; carry the last one seen.
+        current_ts = None
+        for line in lines:
+            ts = parse_cron_timestamp(line)
+            if ts is not None:
+                current_ts = ts
+            if time_filtered and has_ts:
+                if current_ts is None or not in_time_window(current_ts, time_start, time_end):
+                    continue
+            m = CRON_EVENT_RE.search(line)
+            if m:
+                hook = m.group(1)
+                try:
+                    dur = float(m.group(2))
+                except ValueError:
+                    continue
+                events += 1
+                total_time += dur
+                hooks[hook] += 1
+                if dur > CRON_SLOW_EVENT_SECONDS:
+                    over_slow += 1
+                slowest.append((dur, hook, current_ts))
+            elif CRON_RUN_RE.search(line):
+                runs += 1
+
+    slowest.sort(key=lambda x: x[0], reverse=True)
+    return {
+        "enabled": True,
+        "window_approximate": window_approximate,
+        "log_files_scanned": len(files),
+        "runs": runs,
+        "executed_events": events,
+        "event_time_seconds": round(total_time, 3),
+        "events_over_10s": over_slow,
+        "top_hooks": hooks.most_common(10),
+        "slowest_events": [
+            {
+                "hook": h,
+                "duration_seconds": round(d, 3),
+                "at": ts.strftime(EVENT_TS_FMT) if ts else "",
+            }
+            for d, h, ts in slowest[:10]
+        ],
+    }
+
+
+def analyze_wp_cron(app_stats: dict):
+    rows = sorted(app_stats.items(), key=lambda kv: kv[1]["event_time_seconds"], reverse=True)
+    slow_all = []
+    for app, s in app_stats.items():
+        for ev in s["slowest_events"]:
+            slow_all.append({"app": app, **ev})
+    slow_all.sort(key=lambda e: e["duration_seconds"], reverse=True)
+    return {
+        "log_files_scanned": sum(s["log_files_scanned"] for s in app_stats.values()),
+        "apps_with_cron_logs": len(app_stats),
+        "total_runs": sum(s["runs"] for s in app_stats.values()),
+        "total_executed_events": sum(s["executed_events"] for s in app_stats.values()),
+        "total_event_time_seconds": round(sum(s["event_time_seconds"] for s in app_stats.values()), 3),
+        "top_apps_by_event_time": [
+            {
+                "app": app,
+                "runs": s["runs"],
+                "events": s["executed_events"],
+                "event_time_seconds": s["event_time_seconds"],
+                "events_over_10s": s["events_over_10s"],
+            }
+            for app, s in rows[:10]
+        ],
+        "slowest_events": slow_all[:15],
+        "top_hooks_by_app": [[app, s["top_hooks"][:8]] for app, s in rows[:10]],
+        "apps_window_approximate": sorted(
+            app for app, s in app_stats.items() if s.get("window_approximate")
+        ),
+    }
 
 
 class GeoResolver:
     def __init__(
         self,
         country_db: Path | None = None,
-        asn_db: Path | None = None,
         country_dat_v4: Path | None = None,
         country_dat_v6: Path | None = None,
-        enable_whois_asn: bool = True,
     ):
         self.country_reader = None
-        self.asn_reader = None
         self.legacy_country_v4 = None
         self.legacy_country_v6 = None
         self.geoiplookup_cmd = shutil.which("geoiplookup")
         self.geoiplookup6_cmd = shutil.which("geoiplookup6")
-        self.whois_cmd = shutil.which("whois")
-        self.enable_whois_asn = enable_whois_asn
         self.enabled = False
         self.backend = "none"
         self._country_cache = {}
-        self._asn_cache = {}
 
         try:
             import geoip2.database  # type: ignore
 
             if country_db and country_db.exists():
                 self.country_reader = geoip2.database.Reader(str(country_db))
-            if asn_db and asn_db.exists():
-                self.asn_reader = geoip2.database.Reader(str(asn_db))
-            if self.country_reader or self.asn_reader:
+            if self.country_reader:
                 self.enabled = True
                 self.backend = "mmdb"
         except Exception:
             self.enabled = False
 
         # Fallback to legacy .dat country DB (GeoIP.dat / GeoIPv6.dat).
-        # This fallback can provide country but not ASN.
         if not self.enabled:
             try:
                 import pygeoip  # type: ignore
@@ -121,14 +713,10 @@ class GeoResolver:
             except Exception:
                 self.enabled = False
 
-        # Fallback to system CLIs (geoip-bin + whois), no Python packages needed.
-        # Country comes from geoiplookup{,6}; ASN from whois (Team Cymru first).
-        if not self.enabled and (self.geoiplookup_cmd or self.geoiplookup6_cmd or self.whois_cmd):
+        # Fallback to system CLI (geoip-bin), no Python packages needed.
+        if not self.enabled and (self.geoiplookup_cmd or self.geoiplookup6_cmd):
             self.enabled = True
-            if self.geoiplookup_cmd or self.geoiplookup6_cmd:
-                self.backend = "cli-geoip"
-            else:
-                self.backend = "cli-whois-only"
+            self.backend = "cli-geoip"
 
     def _lookup_country_cli(self, ip: str) -> str:
         try:
@@ -158,112 +746,17 @@ class GeoResolver:
             pass
         return "UNKNOWN"
 
-    def _lookup_asn_whois(self, ip: str) -> str:
-        if not self.whois_cmd or not self.enable_whois_asn:
-            return "UNKNOWN"
-
-        # Try Team Cymru first; it's concise and consistent for ASN lookup.
-        try:
-            proc = subprocess.run(
-                [self.whois_cmd, "-h", "whois.cymru.com", f" -v {ip}"],
-                capture_output=True,
-                text=True,
-                timeout=8,
-                check=False,
-            )
-            out = f"{proc.stdout}\n{proc.stderr}"
-            for line in out.splitlines():
-                if "|" not in line or "AS" in line.upper():
-                    continue
-                m = re.match(r"\s*(\d+)\s*\|", line)
-                if m:
-                    return f"AS{m.group(1)}"
-        except Exception:
-            pass
-
-        # Fallback to standard whois parsing.
-        try:
-            proc = subprocess.run(
-                [self.whois_cmd, ip],
-                capture_output=True,
-                text=True,
-                timeout=8,
-                check=False,
-            )
-            out = f"{proc.stdout}\n{proc.stderr}"
-            m = re.search(r"(?im)^\s*(?:origin|originas|aut-num)\s*:\s*(AS\d+)\b", out)
-            if m:
-                return m.group(1).upper()
-            m = re.search(r"\bAS(\d{1,10})\b", out)
-            if m:
-                return f"AS{m.group(1)}"
-        except Exception:
-            pass
-        return "UNKNOWN"
-
-    def _bulk_lookup_asn_whois(self, ips):
-        """
-        Resolve ASN for many IPs in fewer whois calls.
-        Uses Team Cymru bulk mode and caches all queried IPs.
-        """
-        if not self.whois_cmd or not self.enable_whois_asn:
-            return
-
-        to_query = [ip for ip in ips if ip not in self._asn_cache]
-        if not to_query:
-            return
-
-        chunk_size = 300
-        for i in range(0, len(to_query), chunk_size):
-            chunk = to_query[i : i + chunk_size]
-            payload = "begin\nverbose\n" + "\n".join(chunk) + "\nend\n"
-            resolved = {}
-
-            try:
-                proc = subprocess.run(
-                    [self.whois_cmd, "-h", "whois.cymru.com"],
-                    input=payload,
-                    capture_output=True,
-                    text=True,
-                    timeout=25,
-                    check=False,
-                )
-                out = f"{proc.stdout}\n{proc.stderr}"
-                for line in out.splitlines():
-                    if "|" not in line:
-                        continue
-                    parts = [p.strip() for p in line.split("|")]
-                    if len(parts) < 2:
-                        continue
-                    asn_num = parts[0]
-                    ip_val = parts[1]
-                    if not asn_num.isdigit():
-                        continue
-                    if ip_val:
-                        resolved[ip_val] = f"AS{asn_num}"
-            except Exception:
-                pass
-
-            # Ensure every queried IP gets cached to avoid repeated slow fallbacks.
-            for ip in chunk:
-                self._asn_cache[ip] = resolved.get(ip, "UNKNOWN")
-
-    def prewarm_asn(self, ips):
-        if self.backend in ("cli-geoip", "cli-whois-only"):
-            self._bulk_lookup_asn_whois(ips)
-
     @lru_cache(maxsize=200000)
-    def lookup(self, ip: str):
+    def lookup(self, ip: str) -> str:
         country = "UNKNOWN"
-        asn = "UNKNOWN"
 
         try:
             ipaddress.ip_address(ip)
         except Exception:
-            return country, asn
+            return country
 
         if not self.enabled:
-            return country, asn
+            return country
 
         if self.backend == "mmdb":
             try:
@@ -272,14 +765,6 @@ class GeoResolver:
                     cc = (res.country.iso_code or "").strip().upper()
                     if cc:
                         country = cc
-            except Exception:
-                pass
-
-            try:
-                if self.asn_reader:
-                    res = self.asn_reader.asn(ip)
-                    if res.autonomous_system_number:
-                        asn = f"AS{res.autonomous_system_number}"
             except Exception:
                 pass
         elif self.backend == "legacy-dat":
@@ -292,27 +777,19 @@ class GeoResolver:
                         country = cc
             except Exception:
                 pass
-        elif self.backend in ("cli-geoip", "cli-whois-only"):
+        elif self.backend == "cli-geoip":
             if ip in self._country_cache:
                 country = self._country_cache[ip]
             else:
                 country = self._lookup_country_cli(ip)
                 self._country_cache[ip] = country
 
-            if ip in self._asn_cache:
-                asn = self._asn_cache[ip]
-            else:
-                asn = self._lookup_asn_whois(ip)
-                self._asn_cache[ip] = asn
-
-        return country, asn
+        return country
 
     def close(self):
         try:
             if self.country_reader:
                 self.country_reader.close()
-            if self.asn_reader:
-                self.asn_reader.close()
         except Exception:
             pass
 
@@ -493,15 +970,34 @@ def select_log_files_by_days(log_files, days: int | None):
     return [lf for lf in ordered if backend_log_day_index(lf) <= days]
 
 
-def summarize_app(app: str, app_dir: Path, log_files, geo: GeoResolver, progress: bool = False):
+def summarize_app(
+    app: str,
+    app_dir: Path,
+    log_files,
+    geo: GeoResolver,
+    progress: bool = False,
+    chrome_latest_major: int = 0,
+    chrome_obsolete_margin: int = 40,
+    time_start: datetime | None = None,
+    time_end: datetime | None = None,
+):
+    time_filtered = time_start is not None or time_end is not None
     total = 0
     ip_hits = Counter()
     countries = Counter()
-    asns = Counter()
     endpoints = Counter()
     statuses = Counter()
     ua_non_browser = Counter()
     daily_stats = []
+
+    chrome_majors = Counter()
+    headless_chrome_requests = 0
+
+    query_param_hits = Counter()
+    requests_with_query = 0
+
+    hourly_minute_counts = defaultdict(Counter)
+    hourly_ips = defaultdict(set)
 
     progress_log(progress, f"[{app}] parsing {len(log_files)} log files")
     for idx, lf in enumerate(log_files, start=1):
@@ -509,15 +1005,40 @@ def summarize_app(app: str, app_dir: Path, log_files, geo: GeoResolver, progress
         for line in iter_log_lines(lf):
             if not line.strip():
                 continue
+            ip, endpoint, status, ua, timestamp, hour_key, minute = parse_log_line(line)
+            if time_filtered and not in_time_window(timestamp, time_start, time_end):
+                continue
             total += 1
             file_lines += 1
-            ip, endpoint, status, ua = parse_log_line(line)
 
             endpoints[endpoint] += 1
             statuses[status] += 1
             ip_hits[ip] += 1
 
+            if hour_key:
+                hourly_minute_counts[hour_key][minute] += 1
+                hourly_ips[hour_key].add(ip)
+
+            if "?" in endpoint:
+                requests_with_query += 1
+                query = endpoint.split("?", 1)[1]
+                try:
+                    names = {name for name, _ in parse_qsl(query, keep_blank_values=True)}
+                except Exception:
+                    names = set()
+                for name in names:
+                    query_param_hits[name] += 1
+
             ua_l = ua.lower()
+            m_chrome = CHROME_VERSION_RE.search(ua)
+            if m_chrome:
+                try:
+                    chrome_majors[int(m_chrome.group(1))] += 1
+                except ValueError:
+                    pass
+                if "headless" in ua_l:
+                    headless_chrome_requests += 1
+
             if (
                 ua not in {"UNKNOWN", "-", ""}
                 and not any(marker in ua_l for marker in BROWSER_UA_MARKERS)
@@ -532,20 +1053,42 @@ def summarize_app(app: str, app_dir: Path, log_files, geo: GeoResolver, progress
                 "avg_requests_per_minute": round(file_lines / 1440.0, 4),
             }
         )
-        progress_log(progress, f"[{app}] parsed file {idx}/{len(log_files)}: {lf.name} ({file_lines} lines)")
+        progress_log(
+            progress,
+            f"[{app}] parsed file {idx}/{len(log_files)}: {lf.name} ({file_lines} matching lines)",
+        )
 
-    # Batch ASN lookups for CLI backend to avoid one whois call per unique IP.
     progress_log(progress, f"[{app}] collected {len(ip_hits)} unique IPs from {total} requests")
-    geo.prewarm_asn(tuple(ip_hits.keys()))
-    progress_log(progress, f"[{app}] ASN prewarm completed")
+
+    # Aggregate unique IPs into subnets (/24 IPv4, /48 IPv6).
+    subnet_hits = Counter()
+    subnet_unique_ips = Counter()
     processed_ips = 0
     for ip, cnt in ip_hits.items():
-        cc, asn = geo.lookup(ip)
-        countries[cc] += cnt
-        asns[asn] += cnt
+        countries[country_label(geo.lookup(ip))] += cnt
+        subnet = subnet_for_ip(ip)
+        if subnet:
+            subnet_hits[subnet] += cnt
+            subnet_unique_ips[subnet] += 1
         processed_ips += 1
         if progress and processed_ips % 1000 == 0:
             progress_log(progress, f"[{app}] geo-enriched {processed_ips}/{len(ip_hits)} unique IPs")
+
+    top_ip_subnets = [
+        {"subnet": subnet, "requests": cnt, "unique_ips": subnet_unique_ips[subnet]}
+        for subnet, cnt in subnet_hits.most_common(10)
+    ]
+
+    latest_major = chrome_latest_major if chrome_latest_major > 0 else estimate_latest_chrome_major()
+    user_agent_analysis = analyze_chrome_versions(
+        chrome_majors,
+        total,
+        headless_chrome_requests,
+        latest_major,
+        chrome_obsolete_margin,
+    )
+    query_string_analysis = analyze_query_strings(query_param_hits, requests_with_query, total)
+    hourly_traffic = build_hourly_stats(hourly_minute_counts, hourly_ips)
 
     error_count = sum(v for k, v in statuses.items() if k.isdigit() and (k.startswith("4") or k.startswith("5")))
     error_rate = (error_count / total * 100.0) if total else 0.0
@@ -556,9 +1099,12 @@ def summarize_app(app: str, app_dir: Path, log_files, geo: GeoResolver, progress
         "app_dir": str(app_dir),
         "total_requests": total,
         "top_countries": countries.most_common(10),
-        "top_asn": asns.most_common(10),
+        "top_ip_subnets": top_ip_subnets,
         "top_endpoints": endpoints.most_common(10),
         "top_non_browser_user_agents": ua_non_browser.most_common(10),
+        "user_agent_analysis": user_agent_analysis,
+        "query_string_analysis": query_string_analysis,
+        "hourly_traffic": hourly_traffic,
         "status_breakdown": sorted(statuses.items(), key=lambda x: x[0]),
         "error_count": error_count,
         "error_rate_percent": round(error_rate, 2),
@@ -566,24 +1112,181 @@ def summarize_app(app: str, app_dir: Path, log_files, geo: GeoResolver, progress
     }
 
 
-def count_requests(log_files):
+def count_requests(log_files, time_start: datetime | None = None, time_end: datetime | None = None):
+    time_filtered = time_start is not None or time_end is not None
     total = 0
     for lf in log_files:
         for line in iter_log_lines(lf):
-            if line.strip():
-                total += 1
+            if not line.strip():
+                continue
+            if time_filtered and not in_time_window(parse_line_timestamp(line), time_start, time_end):
+                continue
+            total += 1
     return total
 
 
-def render_report(top5, all_sorted, roots, geo_backend, out_json_path):
+def parse_user_time(value: str) -> datetime | None:
+    """Accept 'DD-MM-YYYY:HH' or 'DD-MM-YYYY:HH:MM' (UTC). Returns None if invalid."""
+    for fmt in ("%d-%m-%Y:%H:%M", "%d-%m-%Y:%H"):
+        try:
+            return datetime.strptime(value.strip(), fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def describe_time_window(time_start: datetime | None, time_end: datetime | None, hours: int | None) -> str:
+    if hours is not None:
+        return f"last {hours} hour(s) (since {time_start:%d/%b/%Y %H:%M} UTC)"
+    if time_start is not None or time_end is not None:
+        start_s = f"{time_start:%d/%b/%Y %H:%M}" if time_start else "beginning of logs"
+        end_s = f"{time_end:%d/%b/%Y %H:%M}" if time_end else "end of logs"
+        return f"from {start_s} to {end_s} (UTC)"
+    return "all available log data"
+
+
+def render_wp_cron_section(cron: dict) -> list[str]:
+    out = []
+    out.append("=" * 80)
+    out.append("WP-Cron / Cloudways Cron Optimizer Analysis")
+    if cron.get("time_window"):
+        out.append(f"Time window: {cron['time_window']}")
+    out.append(f"Log files scanned: {cron['log_files_scanned']}")
+    out.append(f"Applications with Cron logs: {cron['apps_with_cron_logs']}")
+    out.append(f"Total Cron runs: {cron['total_runs']}")
+    out.append(f"Total executed events: {cron['total_executed_events']}")
+    out.append(f"Total event execution time: {cron['total_event_time_seconds']}s")
+    out.append("")
+    out.append("Top applications by cumulative event execution time:")
+    out.append(f"  {'App':<24}{'Runs':>7}{'Events':>9}{'Event time':>13}{'>10s':>7}")
+    for r in cron["top_apps_by_event_time"]:
+        out.append(
+            f"  {r['app']:<24}{r['runs']:>7}{r['events']:>9}"
+            f"{r['event_time_seconds']:>13.3f}{r['events_over_10s']:>7}"
+        )
+    out.append("")
+    out.append("Slowest individual Cron events:")
+    for ev in cron["slowest_events"]:
+        at = f" ({ev['at']})" if ev.get("at") else ""
+        out.append(f"  - {ev['app']}: {ev['hook']} = {ev['duration_seconds']}s{at}")
+    out.append("")
+    out.append("Most frequent hooks by application:")
+    for app, hooks in cron["top_hooks_by_app"]:
+        out.append("  - " + app + ": " + ", ".join(f"{h} ({c})" for h, c in hooks))
+    out.append("")
+    out.append(
+        "Note: event execution time is the sum of WP-CLI reported event durations; "
+        "it is not total wall-clock run time."
+    )
+    approx = cron.get("apps_window_approximate") or []
+    if approx:
+        out.append(
+            "Note: cron log lines for these apps carry no timestamps, so the time window "
+            "was approximated by log rotation/mtime only: " + ", ".join(approx)
+        )
+    out.append("")
+    return out
+
+
+def render_fpm_oom_section(fpm: dict | None, oom: dict | None, only_app: str = "") -> list[str]:
+    out = []
+    out.append("=" * 80)
+    out.append("PHP-FPM max_children Breaches & OOM Events (server logs)")
+    window = (fpm or oom or {}).get("time_window", "")
+    if window:
+        out.append(f"Time window: {window}")
+    if only_app:
+        out.append(f"(FPM breaches filtered to pool: {only_app})")
+
+    out.append("\nFPM max_children breaches:")
+    if fpm is None:
+        out.append("  - Skipped")
+    elif not fpm["log_files_scanned"]:
+        out.append("  - No FPM log files found/readable")
+    elif not fpm["total_breaches"]:
+        out.append("  - No breaches found")
+    else:
+        out.append(
+            f"  Total breaches: {fpm['total_breaches']} across {fpm['pools_affected']} pool(s), "
+            f"{fpm['incident_count']} incidents ({fpm['burst_incidents']} burst / {fpm['isolated_incidents']} isolated)"
+        )
+        if fpm["most_common_pool"]:
+            mc = fpm["most_common_pool"]
+            mc_count = dict((p, c) for p, c in fpm["breaches_per_pool"]).get(mc, 0)
+            out.append(
+                f"  Most affected pool: {mc} ({mc_count} breaches, "
+                f"pm.max_children={fpm['pool_limits'].get(mc, '?')})"
+            )
+        out.append("  Breaches per pool:")
+        for pool, cnt in fpm["breaches_per_pool"]:
+            out.append(f"    - {pool}: {cnt} (pm.max_children={fpm['pool_limits'].get(pool, '?')})")
+        out.append("  Breaches per hour:")
+        out.append(f"    {'Hour':<20}{'Breaches':>10}")
+        for hour, cnt in fpm["breaches_per_hour"]:
+            out.append(f"    {hour:<20}{cnt:>10}")
+        out.append(f"  Top surges (clustered within {fpm['cluster_gap_seconds']}s):")
+        for inc in fpm["top_surges"]:
+            out.append(
+                f"    - [{inc['type']}] pool {inc['pool']}: {inc['start']} -> {inc['end']} "
+                f"({inc['breach_count']} breaches in {inc['duration_seconds']}s)"
+            )
+
+    out.append("\nOOM killer events (syslog):")
+    if oom is None:
+        out.append("  - Skipped")
+    elif not oom["log_files_scanned"]:
+        out.append("  - No syslog files found/readable")
+    elif not oom["oom_kill_count"]:
+        out.append("  - No OOM kills found")
+    else:
+        out.append(f"  Total OOM kills: {oom['oom_kill_count']}")
+        out.append(
+            "  Killed processes: "
+            + ", ".join(f"{p} ({c})" for p, c in oom["killed_processes"])
+        )
+        out.append("  Kill timestamps:")
+        for ts in oom["timestamps"][:20]:
+            out.append(f"    - {ts}")
+        if len(oom["timestamps"]) > 20:
+            out.append(f"    ... and {oom['oom_kill_count'] - 20} more")
+        if oom["clusters"]:
+            out.append(f"  Clustered kills (within {oom['cluster_gap_seconds']}s of each other):")
+            for c in oom["clusters"]:
+                out.append(
+                    f"    - {c['start']} -> {c['end']} ({c['kill_count']} kills in {c['duration_seconds']}s)"
+                )
+        else:
+            out.append("  Clustered kills: none (no kills close together)")
+
+    out.append("")
+    return out
+
+
+def render_report(
+    top5,
+    all_sorted,
+    roots,
+    geo_backend,
+    out_json_path,
+    only_app: str = "",
+    time_window_desc: str = "",
+    fpm_analysis: dict | None = None,
+    oom_analysis: dict | None = None,
+    wp_cron_analysis: dict | None = None,
+):
     out = []
     out.append("Cloudways Backend Access Traffic Summary")
     out.append(f"Generated: {now_utc_iso()}")
     out.append(f"Roots scanned: {', '.join(str(r) for r in roots)}")
     out.append(f"GeoIP backend: {geo_backend}")
+    if time_window_desc:
+        out.append(f"Time window: {time_window_desc}")
     out.append("")
 
-    out.append("Top 5 applications by total traffic")
+    if only_app:
+        out.append(f"Single application mode (--only-app {only_app})")
+    else:
+        out.append("Top 5 applications by total traffic")
     for idx, row in enumerate(top5, 1):
         out.append(f"{idx}. {row['app']} - {row['total_requests']} requests")
 
@@ -606,9 +1309,13 @@ def render_report(top5, all_sorted, roots, geo_backend, out_json_path):
         for k, v in row["top_countries"]:
             out.append(f"  - {k}: {v}")
 
-        out.append("\nTop ASN:")
-        for k, v in row["top_asn"]:
-            out.append(f"  - {k}: {v}")
+        out.append("\nTop IP Subnets (/24 IPv4, /48 IPv6):")
+        if row["top_ip_subnets"]:
+            out.append(f"  {'Subnet':<28}{'Requests':>10}{'Unique IPs':>12}")
+            for s in row["top_ip_subnets"]:
+                out.append(f"  {s['subnet']:<28}{s['requests']:>10}{s['unique_ips']:>12}")
+        else:
+            out.append("  - None found")
 
         out.append("\nTop Endpoints:")
         for k, v in row["top_endpoints"]:
@@ -620,6 +1327,107 @@ def render_report(top5, all_sorted, roots, geo_backend, out_json_path):
                 out.append(f"  - {k}: {v}")
         else:
             out.append("  - None found")
+
+        ua = row.get("user_agent_analysis", {})
+        spoof = ua.get("spoofing_indicators", {})
+        out.append("\nUser-Agent (Chrome/Chromium) Analysis:")
+        out.append(
+            f"  Claimed Chrome traffic: {ua.get('claimed_chrome_requests', 0)} requests "
+            f"({ua.get('claimed_chrome_percent', 0)}%)"
+        )
+        out.append(f"  Distinct Chrome major versions: {ua.get('distinct_major_versions', 0)}")
+        out.append(
+            f"  Latest known Chrome major used for checks: v{ua.get('estimated_latest_major', '?')} "
+            f"(obsolete cutoff: v{ua.get('obsolete_cutoff_major', '?')} and older)"
+        )
+        out.append("  Spoofing indicators:")
+        obsolete = spoof.get("obsolete_versions", {})
+        nonexistent = spoof.get("nonexistent_versions", {})
+        if obsolete.get("requests"):
+            out.append(
+                f"    - Obsolete Chrome {obsolete.get('range', '')}: {obsolete['requests']} requests "
+                f"across {obsolete.get('distinct_versions', 0)} outdated major versions"
+            )
+        else:
+            out.append("    - Obsolete Chrome versions: none detected")
+        if nonexistent.get("requests"):
+            out.append(
+                f"    - Non-existent Chrome {nonexistent.get('range', '')}: {nonexistent['requests']} requests "
+                f"(versions above latest known release)"
+            )
+        else:
+            out.append("    - Non-existent (future) Chrome versions: none detected")
+        if spoof.get("headless_chrome_requests"):
+            out.append(f"    - HeadlessChrome: {spoof['headless_chrome_requests']} requests")
+        if ua.get("top_major_versions"):
+            out.append("  Top claimed Chrome majors:")
+            for ver, cnt in ua["top_major_versions"]:
+                out.append(f"    - {ver}: {cnt}")
+
+        qs = row.get("query_string_analysis", {})
+        out.append("\nQuery String Analysis:")
+        out.append(
+            f"  Requests with query strings: {qs.get('requests_with_query_string', 0)} "
+            f"({qs.get('percent_of_total', 0)}% of total)"
+        )
+        if qs.get("top_parameters"):
+            out.append(f"  Distinct parameters seen: {qs.get('distinct_parameters', 0)}")
+            out.append(f"  {'Parameter':<44}{'Hits':>8}")
+            for name, hits in qs["top_parameters"]:
+                out.append(f"  {name:<44}{hits:>8}")
+        else:
+            out.append("  - No query string traffic found")
+
+        out.append("\nHourly Traffic (requests/minute stats + unique IPs):")
+        hourly = row.get("hourly_traffic", [])
+        if hourly:
+            out.append(f"  {'Hour':<20}{'Min/min':>9}{'Avg/min':>9}{'Max/min':>9}{'Total':>10}{'Unique IPs':>12}")
+            for h in hourly:
+                out.append(
+                    f"  {h['hour']:<20}{h['min_per_minute']:>9}{h['avg_per_minute']:>9}"
+                    f"{h['max_per_minute']:>9}{h['total_requests']:>10}{h['unique_ips']:>12}"
+                )
+        else:
+            out.append("  - No timestamps parsed from logs")
+
+        fpm = row.get("fpm_breaches")
+        if fpm is not None:
+            out.append(f"\nFPM max_children Breaches (pool {row['app']}):")
+            if fpm["total_breaches"]:
+                limit = fpm["pool_limits"].get(row["app"], "?")
+                out.append(
+                    f"  Total: {fpm['total_breaches']} breaches (pm.max_children={limit}), "
+                    f"{fpm['burst_incidents']} burst / {fpm['isolated_incidents']} isolated incidents"
+                )
+                busiest = sorted(fpm["breaches_per_hour"], key=lambda kv: kv[1], reverse=True)[:3]
+                if busiest:
+                    out.append("  Busiest hours: " + ", ".join(f"{h} ({c})" for h, c in busiest))
+                for inc in fpm["top_surges"][:3]:
+                    out.append(
+                        f"  - [{inc['type']}] {inc['start']} -> {inc['end']} "
+                        f"({inc['breach_count']} breaches in {inc['duration_seconds']}s)"
+                    )
+            else:
+                out.append("  - None found in scanned FPM logs")
+
+        cron = row.get("wp_cron")
+        if cron:
+            out.append("\nWP-Cron (Cloudways Cron Optimizer): enabled")
+            out.append(
+                f"  Cron runs: {cron['runs']}, executed events: {cron['executed_events']}, "
+                f"event time: {cron['event_time_seconds']}s, events >10s: {cron['events_over_10s']}"
+            )
+            if cron.get("window_approximate"):
+                out.append(
+                    "  (log lines carry no timestamps; time window approximated by log rotation/mtime)"
+                )
+            if cron["top_hooks"]:
+                out.append("  Top hooks: " + ", ".join(f"{h} ({c})" for h, c in cron["top_hooks"][:8]))
+            if cron["slowest_events"]:
+                out.append("  Slowest events:")
+                for ev in cron["slowest_events"][:5]:
+                    at = f" ({ev['at']})" if ev.get("at") else ""
+                    out.append(f"    - {ev['hook']} = {ev['duration_seconds']}s{at}")
 
         out.append("\nStatus Breakdown:")
         for code, cnt in row["status_breakdown"]:
@@ -633,6 +1441,12 @@ def render_report(top5, all_sorted, roots, geo_backend, out_json_path):
             out.append(f"Health check log: {hc['log_file']}")
 
         out.append("")
+
+    if wp_cron_analysis is not None:
+        out.extend(render_wp_cron_section(wp_cron_analysis))
+
+    if fpm_analysis is not None or oom_analysis is not None:
+        out.extend(render_fpm_oom_section(fpm_analysis, oom_analysis, only_app=only_app))
 
     out.append("=" * 80)
     out.append("All applications by traffic")
@@ -662,19 +1476,36 @@ def main():
         action="store_true",
         help="Print progress updates to stderr",
     )
-    parser.add_argument(
-        "--disable-whois-asn",
-        action="store_true",
-        help="Disable whois ASN resolution to speed up analysis",
-    )
     parser.add_argument("--country-mmdb", default="")
-    parser.add_argument("--asn-mmdb", default="")
     parser.add_argument("--country-dat", default="")
     parser.add_argument("--countryv6-dat", default="")
+    parser.add_argument(
+        "--chrome-latest-major",
+        type=int,
+        default=0,
+        help=(
+            "Latest released Chrome major version, used to flag non-existent/spoofed versions. "
+            "Default 0 = auto-estimate from release cadence"
+        ),
+    )
+    parser.add_argument(
+        "--chrome-obsolete-margin",
+        type=int,
+        default=40,
+        help="Chrome majors this far (or more) behind the latest are flagged as obsolete",
+    )
     parser.add_argument(
         "--strict-root",
         action="store_true",
         help="Scan only --applications-root and do not auto-discover other /home roots",
+    )
+    parser.add_argument(
+        "--only-app",
+        default="",
+        help=(
+            "Analyze only this application (directory name under the applications root, "
+            "e.g. abcdefghij). Skips ranking/processing of all other apps"
+        ),
     )
     day_group = parser.add_mutually_exclusive_group()
     day_group.add_argument(
@@ -691,11 +1522,75 @@ def main():
         action="store_true",
         help="Use all available rotated logs (default behavior)",
     )
+    day_group.add_argument(
+        "--hour",
+        type=int,
+        default=None,
+        help=(
+            "Only analyze the last N hours of traffic (UTC, based on log timestamps). "
+            "e.g. --hour 1 = last hour, --hour 12 = last 12 hours. Cannot be combined with --days"
+        ),
+    )
+    parser.add_argument(
+        "--skip-fpm-oom",
+        action="store_true",
+        help="Skip PHP-FPM max_children breach and OOM killer analysis",
+    )
+    parser.add_argument(
+        "--fpm-log-glob",
+        default="/var/log/php*log*",
+        help="Glob for PHP-FPM logs incl. rotated .gz (default: /var/log/php*log*)",
+    )
+    parser.add_argument(
+        "--syslog-glob",
+        default="/var/log/syslog*",
+        help="Glob for syslog files incl. rotated .gz (default: /var/log/syslog*)",
+    )
+    parser.add_argument(
+        "--from-time",
+        default="",
+        help="Start of scan window in UTC, format DD-MM-YYYY:HH or DD-MM-YYYY:HH:MM (e.g. 10-07-2026:00)",
+    )
+    parser.add_argument(
+        "--to-time",
+        default="",
+        help="End of scan window in UTC, format DD-MM-YYYY:HH or DD-MM-YYYY:HH:MM (e.g. 10-07-2026:14:30)",
+    )
     args = parser.parse_args()
     if args.days is not None and args.days < 1:
         parser.error("--days must be >= 1")
     if args.all_days:
         args.days = None
+    if args.hour is not None and args.hour < 1:
+        parser.error("--hour must be >= 1")
+    if args.hour is not None and (args.from_time or args.to_time):
+        parser.error("--hour cannot be combined with --from-time/--to-time")
+    if args.days is not None and (args.from_time or args.to_time):
+        parser.error("--days cannot be combined with --from-time/--to-time (the window may span rotated files)")
+
+    time_start = None
+    time_end = None
+    if args.hour is not None:
+        time_start = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=args.hour)
+        # Only read the rotated files that can contain the window (1-24h ->
+        # access.log, 25-48h -> + access.log.1, ...); timestamp filtering
+        # still applies line by line within those files.
+        args.days = (args.hour + 23) // 24
+    if args.from_time:
+        time_start = parse_user_time(args.from_time)
+        if time_start is None:
+            parser.error(f"Invalid --from-time '{args.from_time}'. Expected DD-MM-YYYY:HH or DD-MM-YYYY:HH:MM (UTC)")
+    if args.to_time:
+        time_end = parse_user_time(args.to_time)
+        if time_end is None:
+            parser.error(f"Invalid --to-time '{args.to_time}'. Expected DD-MM-YYYY:HH or DD-MM-YYYY:HH:MM (UTC)")
+        if len(args.to_time.strip().split(":")) == 2:
+            # Hour-only end bound: include the whole hour.
+            time_end = time_end.replace(minute=59, second=59)
+    if time_start and time_end and time_start > time_end:
+        parser.error("--from-time must be earlier than --to-time")
+
+    time_window_desc = describe_time_window(time_start, time_end, args.hour)
 
     progress = args.progress
     progress_log(progress, "Starting backend access log analysis")
@@ -741,11 +1636,6 @@ def main():
         "/usr/local/share/GeoIP/GeoLite2-Country.mmdb",
         "/var/lib/GeoIP/GeoLite2-Country.mmdb",
     ])
-    asn_db = Path(args.asn_mmdb) if args.asn_mmdb else find_default_geoip_path([
-        "/usr/share/GeoIP/GeoLite2-ASN.mmdb",
-        "/usr/local/share/GeoIP/GeoLite2-ASN.mmdb",
-        "/var/lib/GeoIP/GeoLite2-ASN.mmdb",
-    ])
     country_dat = Path(args.country_dat) if args.country_dat else find_default_geoip_path([
         "/usr/share/GeoIP/GeoIP.dat",
         "/usr/local/share/GeoIP/GeoIP.dat",
@@ -758,15 +1648,37 @@ def main():
     ])
 
     progress_log(progress, f"Found {len(apps)} applications with backend logs")
+
+    if args.only_app:
+        if args.only_app in apps:
+            apps = {args.only_app: apps[args.only_app]}
+            progress_log(progress, f"Single-app mode: only analyzing {args.only_app}")
+        else:
+            available = ", ".join(sorted(apps.keys()))
+            payload = {
+                "generated_at": now_utc_iso(),
+                "error": f"Application '{args.only_app}' not found",
+                "roots": [str(x) for x in roots],
+                "available_applications": sorted(apps.keys()),
+            }
+            Path(args.output_json).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            Path(args.output_txt).write_text(
+                f"Application '{args.only_app}' not found under scanned roots.\n"
+                f"Available applications: {available}\n",
+                encoding="utf-8",
+            )
+            print(Path(args.output_txt).read_text(encoding="utf-8"))
+            return 1
+
     # First pass: rank all apps by total request count only (fast).
-    progress_log(progress, "Pass 1/2: ranking all applications by request count")
+    progress_log(progress, f"Pass 1/2: ranking all applications by request count ({time_window_desc})")
     ranked_apps = []
     for idx, (app, data) in enumerate(apps.items(), start=1):
         selected_logs = select_log_files_by_days(data["log_files"], args.days)
         if not selected_logs:
             progress_log(progress, f"[rank {idx}/{len(apps)}] {app}: skipped (no logs in selected day window)")
             continue
-        total = count_requests(selected_logs)
+        total = count_requests(selected_logs, time_start, time_end)
         ranked_apps.append(
             {
                 "app": app,
@@ -800,14 +1712,15 @@ def main():
 
     # Second pass: full enrichment only for top 5 apps.
     progress_log(progress, "Pass 2/2: enriching top 5 applications")
-    geo = GeoResolver(
-        country_db,
-        asn_db,
-        country_dat,
-        countryv6_dat,
-        enable_whois_asn=not args.disable_whois_asn,
+    geo = GeoResolver(country_db, country_dat, countryv6_dat)
+    progress_log(progress, f"Geo backend selected: {geo.backend}")
+    chrome_latest = args.chrome_latest_major if args.chrome_latest_major > 0 else estimate_latest_chrome_major()
+    progress_log(
+        progress,
+        f"Chrome version checks: latest_major=v{chrome_latest} "
+        f"({'override' if args.chrome_latest_major > 0 else 'auto-estimated'}), "
+        f"obsolete_margin={args.chrome_obsolete_margin}",
     )
-    progress_log(progress, f"Geo backend selected: {geo.backend} (whois_asn_enabled={not args.disable_whois_asn})")
     top5 = []
     for idx, row in enumerate(top5_candidates, start=1):
         progress_log(progress, f"[top {idx}/{len(top5_candidates)}] processing {row['app']}")
@@ -818,10 +1731,66 @@ def main():
                 row["log_files"],
                 geo,
                 progress=progress,
+                chrome_latest_major=chrome_latest,
+                chrome_obsolete_margin=args.chrome_obsolete_margin,
+                time_start=time_start,
+                time_end=time_end,
             )
         )
     geo.close()
     progress_log(progress, "Top 5 enrichment complete")
+
+    # WP-Cron / Cloudways Cron Optimizer: parse each app's wp-cron.log* if present.
+    # Apps without cron logs are omitted entirely (no cron optimizer configured).
+    progress_log(progress, "Scanning wp-cron logs (Cloudways Cron Optimizer)")
+    app_cron_stats = {}
+    for app, data in apps.items():
+        stats = scan_wp_cron_logs(Path(str(data["app_dir"])), args.days, time_start, time_end)
+        if stats:
+            app_cron_stats[app] = stats
+    progress_log(progress, f"Cron optimizer logs found for {len(app_cron_stats)}/{len(apps)} applications")
+    wp_cron_analysis = None
+    if app_cron_stats:
+        wp_cron_analysis = analyze_wp_cron(app_cron_stats)
+        wp_cron_analysis["time_window"] = time_window_desc
+    for row in top5:
+        row["wp_cron"] = app_cron_stats.get(row["app"])
+
+    fpm_analysis = None
+    oom_analysis = None
+    if not args.skip_fpm_oom:
+        # --days limits which rotated *app log files* are read, but FPM/syslog files
+        # span months. Translate --days N into a timestamp cutoff (last N*24h) so
+        # the FPM/OOM scan honors the same period; --hour/--from-time/--to-time
+        # already provide explicit bounds via time_start/time_end.
+        fpm_time_start, fpm_time_end = time_start, time_end
+        fpm_window_desc = time_window_desc
+        if args.days is not None and time_start is None and time_end is None:
+            fpm_time_start = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=args.days)
+            fpm_window_desc = f"last {args.days} day(s) (since {fpm_time_start:%d/%b/%Y %H:%M} UTC)"
+
+        progress_log(
+            progress,
+            f"Scanning FPM logs ({args.fpm_log_glob}) for max_children breaches, window: {fpm_window_desc}",
+        )
+        fpm_events, fpm_files = scan_fpm_breach_logs(args.fpm_log_glob, fpm_time_start, fpm_time_end)
+        progress_log(progress, f"Found {len(fpm_events)} FPM breach lines in {len(fpm_files)} files")
+        progress_log(progress, f"Scanning syslog ({args.syslog_glob}) for OOM killer events")
+        oom_events, syslog_files = scan_oom_events(args.syslog_glob, fpm_time_start, fpm_time_end)
+        progress_log(progress, f"Found {len(oom_events)} OOM kill events in {len(syslog_files)} files")
+
+        # Attach each app's own pool breaches to its per-app summary.
+        for row in top5:
+            app_events = [e for e in fpm_events if e["pool"] == row["app"]]
+            row["fpm_breaches"] = analyze_fpm_breaches(app_events, fpm_files)
+
+        server_events = fpm_events
+        if args.only_app:
+            server_events = [e for e in fpm_events if e["pool"] == args.only_app]
+        fpm_analysis = analyze_fpm_breaches(server_events, fpm_files)
+        fpm_analysis["time_window"] = fpm_window_desc
+        oom_analysis = analyze_oom_events(oom_events, syslog_files)
+        oom_analysis["time_window"] = fpm_window_desc
 
     if not args.skip_health:
         progress_log(progress, "Starting health checks for top 5 applications")
@@ -850,12 +1819,19 @@ def main():
         "roots_scanned": [str(x) for x in roots],
         "geoip_enabled": geo.enabled,
         "geoip_backend": geo.backend,
-        "whois_asn_enabled": not args.disable_whois_asn,
         "days_filter": args.days if args.days is not None else "all",
         "geoip_country_db": str(country_db) if country_db else "",
-        "geoip_asn_db": str(asn_db) if asn_db else "",
         "geoip_country_dat": str(country_dat) if country_dat else "",
         "geoip_countryv6_dat": str(countryv6_dat) if countryv6_dat else "",
+        "chrome_latest_major": chrome_latest,
+        "chrome_obsolete_margin": args.chrome_obsolete_margin,
+        "only_app": args.only_app,
+        "time_window": time_window_desc,
+        "time_window_start_utc": time_start.isoformat() if time_start else "",
+        "time_window_end_utc": time_end.isoformat() if time_end else "",
+        "fpm_breach_analysis": fpm_analysis,
+        "oom_analysis": oom_analysis,
+        "wp_cron_analysis": wp_cron_analysis,
         "total_applications_found": len(ranked_apps),
         "top5": top5,
         "all_applications_sorted": [
@@ -865,7 +1841,18 @@ def main():
     }
 
     Path(args.output_json).write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    report_txt = render_report(top5, ranked_apps, roots, geo.backend, args.output_json)
+    report_txt = render_report(
+        top5,
+        ranked_apps,
+        roots,
+        geo.backend,
+        args.output_json,
+        only_app=args.only_app,
+        time_window_desc=time_window_desc,
+        fpm_analysis=fpm_analysis,
+        oom_analysis=oom_analysis,
+        wp_cron_analysis=wp_cron_analysis,
+    )
     Path(args.output_txt).write_text(report_txt, encoding="utf-8")
 
     progress_log(progress, f"Wrote outputs: {args.output_json} and {args.output_txt}")

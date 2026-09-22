@@ -468,7 +468,23 @@ def build_report_html(traffic: dict, health_by_app: Dict[str, dict], output_path
 
         # full lists (not only top1)
         out.append(render_top_table("Top Countries", app.get("top_countries", []), "Country", "Count"))
-        out.append(render_top_table("Top ASN", app.get("top_asn", []), "ASN", "Count"))
+
+        subnets = app.get("top_ip_subnets", [])
+        out.append("<table><tr><th colspan='3'>Top IP Subnets (/24 IPv4, /48 IPv6)</th></tr>")
+        out.append("<tr><th>Subnet</th><th>Requests</th><th>Unique IPs</th></tr>")
+        if not subnets:
+            out.append("<tr><td colspan='3'>N/A</td></tr>")
+        else:
+            for s in subnets:
+                out.append(
+                    "<tr>"
+                    f"<td>{html.escape(str(s.get('subnet', '')))}</td>"
+                    f"<td>{html.escape(str(s.get('requests', '')))}</td>"
+                    f"<td>{html.escape(str(s.get('unique_ips', '')))}</td>"
+                    "</tr>"
+                )
+        out.append("</table>")
+
         out.append(render_top_table("Top Endpoints", app.get("top_endpoints", []), "Endpoint", "Count"))
         out.append(
             render_top_table(
@@ -479,6 +495,105 @@ def build_report_html(traffic: dict, health_by_app: Dict[str, dict], output_path
             )
         )
         out.append(render_top_table("Status Breakdown", app.get("status_breakdown", []), "Status", "Count"))
+
+        ua = app.get("user_agent_analysis", {}) or {}
+        if ua:
+            spoof = ua.get("spoofing_indicators", {}) or {}
+            obsolete = spoof.get("obsolete_versions", {}) or {}
+            nonexistent = spoof.get("nonexistent_versions", {}) or {}
+            out.append(
+                render_kv_table(
+                    "User-Agent (Chrome/Chromium) Analysis",
+                    [
+                        (
+                            "Claimed Chrome traffic",
+                            f"{ua.get('claimed_chrome_requests', 'N/A')} requests "
+                            f"({ua.get('claimed_chrome_percent', 'N/A')}%)",
+                        ),
+                        ("Distinct Chrome major versions", str(ua.get("distinct_major_versions", "N/A"))),
+                        ("Latest known Chrome major", f"v{ua.get('estimated_latest_major', '?')}"),
+                        (
+                            "Obsolete versions (spoofing indicator)",
+                            f"{obsolete.get('range', 'none')}: {obsolete.get('requests', 0)} requests "
+                            f"across {obsolete.get('distinct_versions', 0)} versions",
+                        ),
+                        (
+                            "Non-existent versions (spoofing indicator)",
+                            f"{nonexistent.get('range', 'none')}: {nonexistent.get('requests', 0)} requests",
+                        ),
+                        ("HeadlessChrome requests", str(spoof.get("headless_chrome_requests", 0))),
+                    ],
+                )
+            )
+            out.append(
+                render_top_table(
+                    "Top Claimed Chrome Majors",
+                    ua.get("top_major_versions", []),
+                    "Version",
+                    "Requests",
+                )
+            )
+
+        qs = app.get("query_string_analysis", {}) or {}
+        if qs:
+            out.append(
+                render_kv_table(
+                    "Query String Overview",
+                    [
+                        (
+                            "Requests with query strings",
+                            f"{qs.get('requests_with_query_string', 'N/A')} "
+                            f"({qs.get('percent_of_total', 'N/A')}% of total)",
+                        ),
+                        ("Distinct parameters", str(qs.get("distinct_parameters", "N/A"))),
+                    ],
+                )
+            )
+            out.append(render_top_table("Top Query Parameters", qs.get("top_parameters", []), "Parameter", "Hits"))
+
+        fpm = app.get("fpm_breaches") or {}
+        if fpm:
+            limit = (fpm.get("pool_limits") or {}).get(name, "?")
+            out.append(
+                render_kv_table(
+                    f"FPM max_children Breaches (pool {name})",
+                    [
+                        ("Total breaches", f"{fpm.get('total_breaches', 0)} (pm.max_children={limit})"),
+                        (
+                            "Incidents",
+                            f"{fpm.get('burst_incidents', 0)} burst / {fpm.get('isolated_incidents', 0)} isolated",
+                        ),
+                        (
+                            "Top surge",
+                            (
+                                f"{fpm['top_surges'][0]['start']} -> {fpm['top_surges'][0]['end']} "
+                                f"({fpm['top_surges'][0]['breach_count']} breaches)"
+                                if fpm.get("top_surges")
+                                else "None"
+                            ),
+                        ),
+                    ],
+                )
+            )
+
+        hourly = app.get("hourly_traffic", []) or []
+        if hourly:
+            out.append("<table><tr><th colspan='6'>Hourly Traffic (requests/minute + unique IPs)</th></tr>")
+            out.append(
+                "<tr><th>Hour</th><th>Min/min</th><th>Avg/min</th><th>Max/min</th><th>Total</th><th>Unique IPs</th></tr>"
+            )
+            for h in hourly:
+                out.append(
+                    "<tr>"
+                    f"<td>{html.escape(str(h.get('hour', '')))}</td>"
+                    f"<td>{html.escape(str(h.get('min_per_minute', '')))}</td>"
+                    f"<td>{html.escape(str(h.get('avg_per_minute', '')))}</td>"
+                    f"<td>{html.escape(str(h.get('max_per_minute', '')))}</td>"
+                    f"<td>{html.escape(str(h.get('total_requests', '')))}</td>"
+                    f"<td>{html.escape(str(h.get('unique_ips', '')))}</td>"
+                    "</tr>"
+                )
+            out.append("</table>")
 
         daily = app.get("daily_requests", [])
         if daily:
@@ -560,6 +675,67 @@ def build_report_html(traffic: dict, health_by_app: Dict[str, dict], output_path
             "<tr><td>[Add observation]</td><td>[High/Med/Low]</td><td>[Name]</td><td>[Date]</td><td>[Open/In Progress/Done]</td></tr></table>"
         )
 
+    fpm = traffic.get("fpm_breach_analysis") or {}
+    oom = traffic.get("oom_analysis") or {}
+    if fpm or oom:
+        out.append("<h2>PHP-FPM max_children Breaches &amp; OOM Events (server logs)</h2>")
+    if fpm:
+        out.append(
+            render_kv_table(
+                "FPM Breach Overview",
+                [
+                    ("Total breaches", str(fpm.get("total_breaches", 0))),
+                    ("Pools affected", str(fpm.get("pools_affected", 0))),
+                    ("Most affected pool", str(fpm.get("most_common_pool", "") or "N/A")),
+                    (
+                        "Incidents",
+                        f"{fpm.get('incident_count', 0)} total "
+                        f"({fpm.get('burst_incidents', 0)} burst / {fpm.get('isolated_incidents', 0)} isolated)",
+                    ),
+                ],
+            )
+        )
+        out.append(render_top_table("FPM Breaches per Pool", fpm.get("breaches_per_pool", []), "Pool", "Breaches"))
+        out.append(render_top_table("FPM Breaches per Hour", fpm.get("breaches_per_hour", []), "Hour", "Breaches"))
+        surges = fpm.get("top_surges", [])
+        out.append("<table><tr><th colspan='5'>Top FPM Breach Surges (clustered)</th></tr>")
+        out.append("<tr><th>Type</th><th>Pool</th><th>Start</th><th>End</th><th>Breaches</th></tr>")
+        if not surges:
+            out.append("<tr><td colspan='5'>N/A</td></tr>")
+        else:
+            for s in surges:
+                out.append(
+                    "<tr>"
+                    f"<td>{html.escape(str(s.get('type', '')))}</td>"
+                    f"<td>{html.escape(str(s.get('pool', '')))}</td>"
+                    f"<td>{html.escape(str(s.get('start', '')))}</td>"
+                    f"<td>{html.escape(str(s.get('end', '')))}</td>"
+                    f"<td>{html.escape(str(s.get('breach_count', '')))}</td>"
+                    "</tr>"
+                )
+        out.append("</table>")
+    if oom:
+        out.append(
+            render_kv_table(
+                "OOM Killer Overview",
+                [
+                    ("Total OOM kills", str(oom.get("oom_kill_count", 0))),
+                    (
+                        "Killed processes",
+                        ", ".join(f"{p} ({c})" for p, c in oom.get("killed_processes", [])) or "None",
+                    ),
+                    (
+                        "Clustered kills",
+                        "; ".join(
+                            f"{c.get('start')} -> {c.get('end')} ({c.get('kill_count')} kills)"
+                            for c in oom.get("clusters", [])
+                        )
+                        or "None",
+                    ),
+                ],
+            )
+        )
+
     out.append("<h2>All Applications by Traffic</h2>")
     out.append("<table><tr><th>Rank</th><th>App</th><th>Total Requests</th></tr>")
     for i, row in enumerate(all_sorted, 1):
@@ -591,8 +767,59 @@ def build_reference_csv(top5: List[dict], health_by_app: Dict[str, dict], output
             w.writerow([name, "traffic", "error_rate_percent", app.get("error_rate_percent", "")])
             for k, v in app.get("top_countries", []) or []:
                 w.writerow([name, "top_countries", str(k), str(v)])
-            for k, v in app.get("top_asn", []) or []:
-                w.writerow([name, "top_asn", str(k), str(v)])
+            for s in app.get("top_ip_subnets", []) or []:
+                w.writerow(
+                    [
+                        name,
+                        "top_ip_subnets",
+                        str(s.get("subnet", "")),
+                        f"requests={s.get('requests', '')}, unique_ips={s.get('unique_ips', '')}",
+                    ]
+                )
+            ua = app.get("user_agent_analysis", {}) or {}
+            if ua:
+                spoof = ua.get("spoofing_indicators", {}) or {}
+                w.writerow([name, "user_agent_analysis", "claimed_chrome_requests", ua.get("claimed_chrome_requests", "")])
+                w.writerow([name, "user_agent_analysis", "claimed_chrome_percent", ua.get("claimed_chrome_percent", "")])
+                w.writerow([name, "user_agent_analysis", "distinct_major_versions", ua.get("distinct_major_versions", "")])
+                w.writerow(
+                    [
+                        name,
+                        "user_agent_analysis",
+                        "obsolete_versions",
+                        json.dumps(spoof.get("obsolete_versions", {})),
+                    ]
+                )
+                w.writerow(
+                    [
+                        name,
+                        "user_agent_analysis",
+                        "nonexistent_versions",
+                        json.dumps(spoof.get("nonexistent_versions", {})),
+                    ]
+                )
+                w.writerow([name, "user_agent_analysis", "headless_chrome_requests", spoof.get("headless_chrome_requests", "")])
+            qs = app.get("query_string_analysis", {}) or {}
+            for k, v in qs.get("top_parameters", []) or []:
+                w.writerow([name, "query_string_top_parameters", str(k), str(v)])
+            fpm = app.get("fpm_breaches") or {}
+            if fpm:
+                w.writerow([name, "fpm_breaches", "total_breaches", fpm.get("total_breaches", "")])
+                w.writerow([name, "fpm_breaches", "burst_incidents", fpm.get("burst_incidents", "")])
+                w.writerow([name, "fpm_breaches", "isolated_incidents", fpm.get("isolated_incidents", "")])
+                for hour, cnt in fpm.get("breaches_per_hour", []) or []:
+                    w.writerow([name, "fpm_breaches_per_hour", str(hour), str(cnt)])
+            for h in app.get("hourly_traffic", []) or []:
+                w.writerow(
+                    [
+                        name,
+                        "hourly_traffic",
+                        str(h.get("hour", "")),
+                        f"min={h.get('min_per_minute', '')}, avg={h.get('avg_per_minute', '')}, "
+                        f"max={h.get('max_per_minute', '')}, total={h.get('total_requests', '')}, "
+                        f"unique_ips={h.get('unique_ips', '')}",
+                    ]
+                )
             for k, v in app.get("top_endpoints", []) or []:
                 w.writerow([name, "top_endpoints", str(k), str(v)])
             for k, v in app.get("top_non_browser_user_agents", []) or []:

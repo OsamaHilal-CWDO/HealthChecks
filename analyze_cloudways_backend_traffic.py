@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import sys
+import urllib.request
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
@@ -225,6 +226,106 @@ def subnet_for_ip(ip: str) -> str | None:
         return str(ipaddress.ip_network(f"{ip}/{prefix}", strict=False))
     except Exception:
         return None
+
+
+IP_API_FIELDS = "status,message,country,countryCode,isp,org,hosting,proxy,mobile,query"
+IP_API_DEFAULT_BATCH_URL = "http://ip-api.com/batch"
+
+
+class IpApiEnricher:
+    """Best-effort IP metadata via ip-api.com's batch endpoint (free tier:
+    100 IPs per POST, 15 requests/min). Failures are cached as None so the
+    report degrades to N/A columns instead of stalling or erroring."""
+
+    def __init__(self, batch_url: str = IP_API_DEFAULT_BATCH_URL, timeout: int = 15):
+        self.batch_url = f"{batch_url}?fields={IP_API_FIELDS}"
+        self.timeout = timeout
+        self.cache: dict[str, dict | None] = {}
+
+    def lookup(self, ips):
+        missing = []
+        for ip in dict.fromkeys(ips):
+            if ip in self.cache:
+                continue
+            try:
+                ipaddress.ip_address(ip)
+            except Exception:
+                self.cache[ip] = None
+                continue
+            missing.append(ip)
+
+        for i in range(0, len(missing), 100):
+            chunk = missing[i : i + 100]
+            for ip in chunk:
+                self.cache[ip] = None
+            try:
+                req = urllib.request.Request(
+                    self.batch_url,
+                    data=json.dumps(chunk).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    data = json.load(resp)
+                for item in data:
+                    if not isinstance(item, dict) or item.get("status") != "success":
+                        continue
+                    self.cache[item.get("query", "")] = {
+                        "country": item.get("country", ""),
+                        "country_code": item.get("countryCode", ""),
+                        "isp": item.get("isp", ""),
+                        "org": item.get("org", ""),
+                        "hosting": bool(item.get("hosting")),
+                        "proxy": bool(item.get("proxy")),
+                        "mobile": bool(item.get("mobile")),
+                    }
+            except Exception:
+                pass
+
+        return {ip: self.cache.get(ip) for ip in ips}
+
+
+def ip_info_country(info: dict | None) -> str:
+    if not info or not info.get("country_code"):
+        return "Unknown"
+    return f"{info.get('country') or info['country_code']} ({info['country_code']})"
+
+
+def ip_info_isp(info: dict | None) -> str:
+    if not info:
+        return "N/A"
+    return info.get("isp") or info.get("org") or "N/A"
+
+
+def ip_info_type(info: dict | None) -> str:
+    if not info:
+        return "Unknown"
+    if info.get("hosting"):
+        return "Hosting/DC"
+    if info.get("proxy"):
+        return "Proxy/VPN"
+    if info.get("mobile"):
+        return "Mobile"
+    return "ISP/Residential"
+
+
+def render_box_table(headers, rows, right_align=None, indent="  ") -> list[str]:
+    right_align = right_align or set()
+    widths = []
+    for i, h in enumerate(headers):
+        cells = [len(str(r[i])) for r in rows] if rows else []
+        widths.append(max(len(str(h)), *cells) if cells else len(str(h)))
+
+    def fmt(cells):
+        parts = []
+        for i, c in enumerate(cells):
+            s = str(c)
+            parts.append(s.rjust(widths[i]) if i in right_align else s.ljust(widths[i]))
+        return indent + "│ " + " │ ".join(parts) + " │"
+
+    top = indent + "┌" + "┬".join("─" * (w + 2) for w in widths) + "┐"
+    sep = indent + "├" + "┼".join("─" * (w + 2) for w in widths) + "┤"
+    bottom = indent + "└" + "┴".join("─" * (w + 2) for w in widths) + "┘"
+    return [top, fmt(headers), sep] + [fmt(r) for r in rows] + [bottom]
 
 
 def estimate_latest_chrome_major(now: datetime | None = None) -> int:
@@ -980,6 +1081,7 @@ def summarize_app(
     chrome_obsolete_margin: int = 40,
     time_start: datetime | None = None,
     time_end: datetime | None = None,
+    ip_enricher: IpApiEnricher | None = None,
 ):
     time_filtered = time_start is not None or time_end is not None
     total = 0
@@ -1063,6 +1165,7 @@ def summarize_app(
     # Aggregate unique IPs into subnets (/24 IPv4, /48 IPv6).
     subnet_hits = Counter()
     subnet_unique_ips = Counter()
+    subnet_top_ip = {}
     processed_ips = 0
     for ip, cnt in ip_hits.items():
         countries[country_label(geo.lookup(ip))] += cnt
@@ -1070,14 +1173,54 @@ def summarize_app(
         if subnet:
             subnet_hits[subnet] += cnt
             subnet_unique_ips[subnet] += 1
+            if cnt > subnet_top_ip.get(subnet, (0, ""))[0]:
+                subnet_top_ip[subnet] = (cnt, ip)
         processed_ips += 1
         if progress and processed_ips % 1000 == 0:
             progress_log(progress, f"[{app}] geo-enriched {processed_ips}/{len(ip_hits)} unique IPs")
 
+    def pct(n: int) -> float:
+        return round(n / total * 100.0, 1) if total else 0.0
+
     top_ip_subnets = [
-        {"subnet": subnet, "requests": cnt, "unique_ips": subnet_unique_ips[subnet]}
+        {
+            "subnet": subnet,
+            "requests": cnt,
+            "percent": pct(cnt),
+            "unique_ips": subnet_unique_ips[subnet],
+        }
         for subnet, cnt in subnet_hits.most_common(10)
     ]
+    top_culprits = [
+        ip for ip, _ in ip_hits.most_common(11) if ip not in {"UNKNOWN", "-", ""}
+    ][:10]
+
+    # Enrich the displayed subnets (via their busiest IP) and culprit IPs with
+    # country / ISP / type metadata from ip-api.com. Best-effort: on failure
+    # the columns show Unknown / N/A.
+    enrich_targets = [subnet_top_ip[s["subnet"]][1] for s in top_ip_subnets if s["subnet"] in subnet_top_ip]
+    enrich_targets += top_culprits
+    info_map = ip_enricher.lookup(enrich_targets) if ip_enricher else {}
+    for s in top_ip_subnets:
+        rep_ip = subnet_top_ip.get(s["subnet"], (0, ""))[1]
+        info = info_map.get(rep_ip)
+        s["country"] = ip_info_country(info)
+        s["isp"] = ip_info_isp(info)
+        s["type"] = ip_info_type(info)
+
+    top_culprit_ips = []
+    for ip in top_culprits:
+        info = info_map.get(ip)
+        top_culprit_ips.append(
+            {
+                "ip": ip,
+                "requests": ip_hits[ip],
+                "percent": pct(ip_hits[ip]),
+                "country": ip_info_country(info),
+                "isp": ip_info_isp(info),
+                "type": ip_info_type(info),
+            }
+        )
 
     latest_major = chrome_latest_major if chrome_latest_major > 0 else estimate_latest_chrome_major()
     user_agent_analysis = analyze_chrome_versions(
@@ -1100,6 +1243,7 @@ def summarize_app(
         "total_requests": total,
         "top_countries": countries.most_common(10),
         "top_ip_subnets": top_ip_subnets,
+        "top_culprit_ips": top_culprit_ips,
         "top_endpoints": endpoints.most_common(10),
         "top_non_browser_user_agents": ua_non_browser.most_common(10),
         "user_agent_analysis": user_agent_analysis,
@@ -1305,15 +1449,61 @@ def render_report(
                 f"{d['requests']} requests, avg/min {d['avg_requests_per_minute']}"
             )
 
-        out.append("\nTop Countries:")
-        for k, v in row["top_countries"]:
-            out.append(f"  - {k}: {v}")
+        total_req = row["total_requests"] or 1
 
-        out.append("\nTop IP Subnets (/24 IPv4, /48 IPv6):")
+        out.append("\n▸ Top Countries")
+        country_rows = [
+            [k, v, f"{v / total_req * 100.0:.1f}%"] for k, v in row["top_countries"]
+        ]
+        if country_rows:
+            out.extend(render_box_table(["Country", "Requests", "% Total"], country_rows, right_align={1, 2}))
+        else:
+            out.append("  - None found")
+
+        out.append("\n▸ Top IP Subnets (/24 IPv4, /48 IPv6)")
         if row["top_ip_subnets"]:
-            out.append(f"  {'Subnet':<28}{'Requests':>10}{'Unique IPs':>12}")
-            for s in row["top_ip_subnets"]:
-                out.append(f"  {s['subnet']:<28}{s['requests']:>10}{s['unique_ips']:>12}")
+            subnet_rows = [
+                [
+                    s["subnet"],
+                    s["requests"],
+                    f"{s.get('percent', 0):.1f}%",
+                    s["unique_ips"],
+                    s.get("country", "Unknown"),
+                    s.get("isp", "N/A"),
+                    s.get("type", "Unknown"),
+                ]
+                for s in row["top_ip_subnets"]
+            ]
+            out.extend(
+                render_box_table(
+                    ["Subnet", "Requests", "% Total", "IPs", "Country", "ISP / Org", "Type"],
+                    subnet_rows,
+                    right_align={1, 2, 3},
+                )
+            )
+        else:
+            out.append("  - None found")
+
+        out.append("\n▸ Top Culprit IPs")
+        if row.get("top_culprit_ips"):
+            culprit_rows = [
+                [
+                    c["ip"],
+                    c["requests"],
+                    f"{c.get('percent', 0):.1f}%",
+                    c.get("country", "Unknown"),
+                    c.get("isp", "N/A"),
+                    c.get("type", "Unknown"),
+                ]
+                for c in row["top_culprit_ips"]
+            ]
+            out.extend(
+                render_box_table(
+                    ["IP", "Requests", "% Total", "Country", "ISP / Org", "Type"],
+                    culprit_rows,
+                    right_align={1, 2},
+                )
+            )
         else:
             out.append("  - None found")
 
@@ -1537,6 +1727,16 @@ def main():
         help="Skip PHP-FPM max_children breach and OOM killer analysis",
     )
     parser.add_argument(
+        "--skip-ip-enrichment",
+        action="store_true",
+        help="Skip ip-api.com lookups for subnet/culprit IP country, ISP and type",
+    )
+    parser.add_argument(
+        "--ip-api-url",
+        default=IP_API_DEFAULT_BATCH_URL,
+        help=f"ip-api.com batch endpoint (default: {IP_API_DEFAULT_BATCH_URL})",
+    )
+    parser.add_argument(
         "--fpm-log-glob",
         default="/var/log/php*log*",
         help="Glob for PHP-FPM logs incl. rotated .gz (default: /var/log/php*log*)",
@@ -1714,6 +1914,11 @@ def main():
     progress_log(progress, "Pass 2/2: enriching top 5 applications")
     geo = GeoResolver(country_db, country_dat, countryv6_dat)
     progress_log(progress, f"Geo backend selected: {geo.backend}")
+    ip_enricher = None if args.skip_ip_enrichment else IpApiEnricher(args.ip_api_url)
+    progress_log(
+        progress,
+        "IP enrichment: " + ("disabled" if ip_enricher is None else f"enabled ({args.ip_api_url})"),
+    )
     chrome_latest = args.chrome_latest_major if args.chrome_latest_major > 0 else estimate_latest_chrome_major()
     progress_log(
         progress,
@@ -1735,6 +1940,7 @@ def main():
                 chrome_obsolete_margin=args.chrome_obsolete_margin,
                 time_start=time_start,
                 time_end=time_end,
+                ip_enricher=ip_enricher,
             )
         )
     geo.close()

@@ -470,17 +470,46 @@ def build_report_html(traffic: dict, health_by_app: Dict[str, dict], output_path
         out.append(render_top_table("Top Countries", app.get("top_countries", []), "Country", "Count"))
 
         subnets = app.get("top_ip_subnets", [])
-        out.append("<table><tr><th colspan='3'>Top IP Subnets (/24 IPv4, /48 IPv6)</th></tr>")
-        out.append("<tr><th>Subnet</th><th>Requests</th><th>Unique IPs</th></tr>")
+        out.append("<table><tr><th colspan='7'>Top IP Subnets (/24 IPv4, /48 IPv6)</th></tr>")
+        out.append(
+            "<tr><th>Subnet</th><th>Requests</th><th>% Total</th><th>Unique IPs</th>"
+            "<th>Country</th><th>ISP / Org</th><th>Type</th></tr>"
+        )
         if not subnets:
-            out.append("<tr><td colspan='3'>N/A</td></tr>")
+            out.append("<tr><td colspan='7'>N/A</td></tr>")
         else:
             for s in subnets:
                 out.append(
                     "<tr>"
                     f"<td>{html.escape(str(s.get('subnet', '')))}</td>"
                     f"<td>{html.escape(str(s.get('requests', '')))}</td>"
+                    f"<td>{html.escape(str(s.get('percent', '')))}</td>"
                     f"<td>{html.escape(str(s.get('unique_ips', '')))}</td>"
+                    f"<td>{html.escape(str(s.get('country', '')))}</td>"
+                    f"<td>{html.escape(str(s.get('isp', '')))}</td>"
+                    f"<td>{html.escape(str(s.get('type', '')))}</td>"
+                    "</tr>"
+                )
+        out.append("</table>")
+
+        culprits = app.get("top_culprit_ips", [])
+        out.append("<table><tr><th colspan='6'>Top Culprit IPs</th></tr>")
+        out.append(
+            "<tr><th>IP</th><th>Requests</th><th>% Total</th>"
+            "<th>Country</th><th>ISP / Org</th><th>Type</th></tr>"
+        )
+        if not culprits:
+            out.append("<tr><td colspan='6'>N/A</td></tr>")
+        else:
+            for c in culprits:
+                out.append(
+                    "<tr>"
+                    f"<td>{html.escape(str(c.get('ip', '')))}</td>"
+                    f"<td>{html.escape(str(c.get('requests', '')))}</td>"
+                    f"<td>{html.escape(str(c.get('percent', '')))}</td>"
+                    f"<td>{html.escape(str(c.get('country', '')))}</td>"
+                    f"<td>{html.escape(str(c.get('isp', '')))}</td>"
+                    f"<td>{html.escape(str(c.get('type', '')))}</td>"
                     "</tr>"
                 )
         out.append("</table>")
@@ -773,7 +802,19 @@ def build_reference_csv(top5: List[dict], health_by_app: Dict[str, dict], output
                         name,
                         "top_ip_subnets",
                         str(s.get("subnet", "")),
-                        f"requests={s.get('requests', '')}, unique_ips={s.get('unique_ips', '')}",
+                        f"requests={s.get('requests', '')}, percent={s.get('percent', '')}, "
+                        f"unique_ips={s.get('unique_ips', '')}, country={s.get('country', '')}, "
+                        f"isp={s.get('isp', '')}, type={s.get('type', '')}",
+                    ]
+                )
+            for c in app.get("top_culprit_ips", []) or []:
+                w.writerow(
+                    [
+                        name,
+                        "top_culprit_ips",
+                        str(c.get("ip", "")),
+                        f"requests={c.get('requests', '')}, percent={c.get('percent', '')}, "
+                        f"country={c.get('country', '')}, isp={c.get('isp', '')}, type={c.get('type', '')}",
                     ]
                 )
             ua = app.get("user_agent_analysis", {}) or {}

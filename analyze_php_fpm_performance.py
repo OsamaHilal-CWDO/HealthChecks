@@ -49,13 +49,36 @@ MONTH_NUM = {
 # 150.228.25.72 - [29/Sep/2026:08:56:33 +0000] "GET /x/index.php?id=1" 200 0 - 24747 16153 0.175 27525120 62.75% 28.52% "/x/view.json?id=1"
 ACCESS_RE = re.compile(
     r'^(?P<ip>\S+)\s+\S+\s+'
-    r'\[(?P<day>\d{2})/(?P<mon>[A-Za-z]{3})/(?P<year>\d{4}):(?P<hh>\d{2}):(?P<mm>\d{2}):(?P<ss>\d{2})[^\]]*\]\s+'
+    r'\[(?P<day>\d{1,2})/(?P<mon>[A-Za-z]{3})/(?P<year>\d{4}):(?P<hh>\d{2}):(?P<mm>\d{2}):(?P<ss>\d{2})\s*(?P<tz>[+-]\d{4})?\]\s+'
     r'"(?P<method>[A-Z]+)\s+(?P<script>[^"]*)"\s+'
     r'(?P<status>\d{3})\s+(?P<length>\S+)\s+\S+\s+\S+\s+\S+\s+'
     r'(?P<duration>\d+(?:\.\d+)?)\s+(?P<memory>\d+)\s+'
     r'(?P<cpu_user>[\d.]+)%\s+(?P<cpu_sys>[\d.]+)%\s+'
     r'"(?P<uri>[^"]*)"\s*$'
 )
+
+BRACKET_TS_RE = re.compile(
+    r"(\d{1,2})/([A-Za-z]{3})/(\d{4}):(\d{2}):(\d{2}):(\d{2})\s*([+-]\d{4})?"
+)
+QUOTED_RE = re.compile(r'"[^"]*"')
+STATUS_TOKEN_RE = re.compile(r"[1-5]\d{2}")
+FLOAT_TOKEN_RE = re.compile(r"\d+\.\d+")
+INT_TOKEN_RE = re.compile(r"\d{4,}")
+
+
+def make_ts(year, mon, day, hh, mi, ss, tz):
+    """Build a naive-UTC datetime from log fields, normalizing any TZ offset."""
+    month = MONTH_NUM.get(mon)
+    if not month:
+        return None
+    try:
+        ts = datetime(int(year), month, int(day), int(hh), int(mi), int(ss))
+    except ValueError:
+        return None
+    if tz and tz != "+0000":
+        sign = 1 if tz[0] == "+" else -1
+        ts -= timedelta(minutes=sign * (int(tz[1:3]) * 60 + int(tz[3:5])))
+    return ts
 
 SLOW_HEADER_RE = re.compile(
     r"^\[(\d{2})-([A-Za-z]{3})-(\d{4})\s+(\d{2}):(\d{2}):(\d{2})\]\s+\[pool ([^\]]+)\]\s+pid\s+(\d+)"
@@ -102,25 +125,45 @@ def log_day_slot(path: Path) -> int:
     return 1 if m.group(1) is None else int(m.group(1)) + 1
 
 
+def file_meta(path: Path) -> str:
+    try:
+        st = path.stat()
+        mtime = datetime.fromtimestamp(st.st_mtime, timezone.utc)
+        size = st.st_size
+        if size >= 1024 * 1024:
+            size_s = f"{size / (1024 * 1024):.1f}MB"
+        elif size >= 1024:
+            size_s = f"{size / 1024:.1f}KB"
+        else:
+            size_s = f"{size}B"
+        return f"{path.name} ({size_s}, modified {mtime:%d/%b/%Y %H:%M} UTC)"
+    except OSError:
+        return path.name
+
+
 def select_log_files(logs_dir: Path, base_name: str, days: int | None, time_start: datetime | None):
-    files = sorted(
+    """Return (kept, skipped) where skipped is a list of (file, reason) pairs."""
+    all_files = sorted(
         (f for f in logs_dir.glob(f"{base_name}*") if f.is_file()),
         key=log_day_slot,
     )
-    if days is not None:
-        files = [f for f in files if log_day_slot(f) <= days]
-    if time_start is not None:
-        cutoff = time_start.replace(tzinfo=timezone.utc).timestamp()
-        kept = []
-        for f in files:
+    kept, skipped = [], []
+    for f in all_files:
+        slot = log_day_slot(f)
+        if days is not None and slot > days:
+            skipped.append((f, f"rotation slot {slot} outside --days/--hour window"))
+            continue
+        if time_start is not None:
             try:
-                if f.stat().st_mtime < cutoff:
+                mt = f.stat().st_mtime
+                if mt < time_start.replace(tzinfo=timezone.utc).timestamp():
+                    mtime = datetime.fromtimestamp(mt, timezone.utc)
+                    skipped.append((f, f"last modified {mtime:%d/%b/%Y %H:%M} UTC, older than window start"))
                     continue
             except OSError:
                 pass
-            kept.append(f)
-        files = kept
-    return files
+        kept.append(f)
+    return kept, skipped
 
 
 def in_time_window(ts: datetime | None, start: datetime | None, end: datetime | None) -> bool:
@@ -230,48 +273,149 @@ def short_location(path: str, line: str) -> str:
 
 # --- parsing ------------------------------------------------------------------
 
+def parse_access_line_strict(line):
+    m = ACCESS_RE.match(line)
+    if not m:
+        return None
+    ts = make_ts(m.group("year"), m.group("mon"), m.group("day"),
+                 m.group("hh"), m.group("mm"), m.group("ss"), m.group("tz"))
+    if ts is None:
+        return None
+    uri = m.group("uri") or m.group("script")
+    return {
+        "ts": ts,
+        "ip": m.group("ip"),
+        "method": m.group("method"),
+        "script": m.group("script"),
+        "status": m.group("status"),
+        "duration": float(m.group("duration")),
+        "memory": int(m.group("memory")),
+        "cpu_user": float(m.group("cpu_user")),
+        "cpu_sys": float(m.group("cpu_sys")),
+        "uri": uri,
+        "type": classify_request(uri),
+    }
+
+
+def parse_access_line_flex(line):
+    """Tolerant fallback for FPM access.format variations.
+
+    Relies only on the stable landmarks: leading IP, [timestamp], a quoted
+    "METHOD script" section, a 3-digit status right after it, duration+memory
+    immediately before the CPU %% columns, and an optional trailing quoted URI.
+    """
+    qspans = list(QUOTED_RE.finditer(line))
+    if not qspans:
+        return None
+    first_q = qspans[0].group(0)[1:-1]
+    method, _, script = first_q.partition(" ")
+    if not (2 <= len(method) <= 10 and method.isalpha() and method.isupper()):
+        return None
+    tsm = BRACKET_TS_RE.search(line[: qspans[0].start()])
+    if not tsm:
+        return None
+    day, mon, year, hh, mi, ss, tz = tsm.groups()
+    ts = make_ts(year, mon, day, hh, mi, ss, tz)
+    if ts is None:
+        return None
+
+    middle = line[qspans[0].end(): qspans[-1].start()] if len(qspans) > 1 else line[qspans[0].end():]
+    tokens = middle.split()
+    if not tokens:
+        return None
+    status = tokens[0] if STATUS_TOKEN_RE.fullmatch(tokens[0]) else next(
+        (t for t in tokens if STATUS_TOKEN_RE.fullmatch(t)), None)
+    if status is None:
+        return None
+
+    duration = memory = None
+    cpu_user = cpu_sys = 0.0
+    pct_idx = [i for i, t in enumerate(tokens) if t.endswith("%")]
+    if pct_idx:
+        i = pct_idx[0]
+        try:
+            cpu_user = float(tokens[i].rstrip("%"))
+            if len(pct_idx) > 1:
+                cpu_sys = float(tokens[pct_idx[1]].rstrip("%"))
+        except ValueError:
+            pass
+        if i >= 2:
+            try:
+                duration = float(tokens[i - 2])
+                memory = int(float(tokens[i - 1]))
+            except ValueError:
+                duration = memory = None
+    if duration is None or memory is None:
+        floats = [t for t in tokens if FLOAT_TOKEN_RE.fullmatch(t)]
+        ints = [t for t in tokens if INT_TOKEN_RE.fullmatch(t)]
+        if floats and duration is None:
+            try:
+                duration = float(floats[-1])
+            except ValueError:
+                pass
+        if ints and memory is None:
+            memory = int(ints[-1])
+    if duration is None or memory is None:
+        return None
+
+    uri = script
+    if len(qspans) > 1:
+        last_q = qspans[-1].group(0)[1:-1]
+        if last_q.startswith("/"):
+            uri = last_q
+    return {
+        "ts": ts,
+        "ip": line.split(None, 1)[0],
+        "method": method,
+        "script": script,
+        "status": status,
+        "duration": duration,
+        "memory": memory,
+        "cpu_user": cpu_user,
+        "cpu_sys": cpu_sys,
+        "uri": uri,
+        "type": classify_request(uri),
+    }
+
+
 def parse_access_logs(files, time_start, time_end):
     requests = []
-    unparsed = 0
+    stats = {
+        "lines_read": 0,
+        "parsed": 0,
+        "parsed_flex_format": 0,
+        "out_of_window": 0,
+        "unparsed": 0,
+        "ts_min": None,
+        "ts_max": None,
+        "unparsed_samples": [],
+    }
     for f in files:
         for line in iter_log_lines(f):
             if not line.strip():
                 continue
-            m = ACCESS_RE.match(line)
-            if not m:
-                unparsed += 1
+            stats["lines_read"] += 1
+            rec = parse_access_line_strict(line)
+            if rec is None:
+                rec = parse_access_line_flex(line)
+                if rec is not None:
+                    stats["parsed_flex_format"] += 1
+            if rec is None:
+                stats["unparsed"] += 1
+                if len(stats["unparsed_samples"]) < 3:
+                    stats["unparsed_samples"].append(line[:220])
                 continue
-            month = MONTH_NUM.get(m.group("mon"))
-            if not month:
-                unparsed += 1
-                continue
-            try:
-                ts = datetime(
-                    int(m.group("year")), month, int(m.group("day")),
-                    int(m.group("hh")), int(m.group("mm")), int(m.group("ss")),
-                )
-            except ValueError:
-                unparsed += 1
-                continue
+            stats["parsed"] += 1
+            ts = rec["ts"]
+            if stats["ts_min"] is None or ts < stats["ts_min"]:
+                stats["ts_min"] = ts
+            if stats["ts_max"] is None or ts > stats["ts_max"]:
+                stats["ts_max"] = ts
             if not in_time_window(ts, time_start, time_end):
+                stats["out_of_window"] += 1
                 continue
-            uri = m.group("uri") or m.group("script")
-            requests.append(
-                {
-                    "ts": ts,
-                    "ip": m.group("ip"),
-                    "method": m.group("method"),
-                    "script": m.group("script"),
-                    "status": m.group("status"),
-                    "duration": float(m.group("duration")),
-                    "memory": int(m.group("memory")),
-                    "cpu_user": float(m.group("cpu_user")),
-                    "cpu_sys": float(m.group("cpu_sys")),
-                    "uri": uri,
-                    "type": classify_request(uri),
-                }
-            )
-    return requests, unparsed
+            requests.append(rec)
+    return requests, stats
 
 
 def parse_slow_logs(files, time_start, time_end):
@@ -423,13 +567,13 @@ def render_memory_chart(series, width: int = 36) -> list[str]:
 
 
 def analyze_app(app, logs_dir, args, time_start, time_end, progress):
-    access_files = select_log_files(logs_dir, "php-app.access.log", args.days, time_start)
-    slow_files = select_log_files(logs_dir, "php-app.slow.log", args.days, time_start)
-    if not access_files and not slow_files:
+    access_files, access_skipped = select_log_files(logs_dir, "php-app.access.log", args.days, time_start)
+    slow_files, slow_skipped = select_log_files(logs_dir, "php-app.slow.log", args.days, time_start)
+    if not (access_files or slow_files or access_skipped or slow_skipped):
         return None
 
     progress_log(progress, f"[{app}] parsing {len(access_files)} access + {len(slow_files)} slow log files")
-    requests, unparsed = parse_access_logs(access_files, time_start, time_end)
+    requests, access_stats = parse_access_logs(access_files, time_start, time_end)
     slow_entries = parse_slow_logs(slow_files, time_start, time_end)
     total_parsed = len(requests)
 
@@ -468,10 +612,23 @@ def analyze_app(app, logs_dir, args, time_start, time_end, progress):
         "app": app,
         "logs_dir": str(logs_dir),
         "access_log_files": [f.name for f in access_files],
+        "access_log_files_detail": [file_meta(f) for f in access_files],
+        "access_log_files_skipped": [f"{f.name}: {reason}" for f, reason in access_skipped],
         "slow_log_files": [f.name for f in slow_files],
+        "slow_log_files_skipped": [f"{f.name}: {reason}" for f, reason in slow_skipped],
         "requests_parsed_total": total_parsed,
         "requests_after_filters": len(requests),
-        "unparsed_lines": unparsed,
+        "unparsed_lines": access_stats["unparsed"],
+        "access_parse_stats": {
+            "lines_read": access_stats["lines_read"],
+            "parsed": access_stats["parsed"],
+            "parsed_flex_format": access_stats["parsed_flex_format"],
+            "out_of_window": access_stats["out_of_window"],
+            "unparsed": access_stats["unparsed"],
+            "log_ts_min": access_stats["ts_min"].strftime("%d/%b/%Y %H:%M:%S") if access_stats["ts_min"] else None,
+            "log_ts_max": access_stats["ts_max"].strftime("%d/%b/%Y %H:%M:%S") if access_stats["ts_max"] else None,
+            "unparsed_samples": access_stats["unparsed_samples"],
+        },
         "slow_log_entries": len(slow_entries),
     }
 
@@ -589,7 +746,38 @@ def render_app_report(res, filters_desc: str) -> list[str]:
 
     mo = res.get("memory_overview")
     if not mo:
-        out.append("\n  No access-log requests matched. Nothing to report from php-app.access.log.")
+        out.append("\n▸ Memory / Duration Profiling (php-app.access.log)")
+        out.append("  No usable requests in this window — memory profiling and avg/max duration")
+        out.append("  come from php-app.access.log. Diagnostics:")
+        st = res.get("access_parse_stats", {})
+        if res.get("access_log_files_detail"):
+            out.append("    Access files read:  " + ", ".join(res["access_log_files_detail"]))
+        else:
+            out.append("    Access files read:  none")
+        if res.get("access_log_files_skipped"):
+            out.append("    Files skipped:      " + "; ".join(res["access_log_files_skipped"]))
+        if not res.get("access_log_files") and not res.get("access_log_files_skipped"):
+            out.append("    No php-app.access.log* files exist in this logs directory —")
+            out.append("    the FPM access log may be disabled for this app.")
+        if st.get("lines_read"):
+            out.append(
+                f"    Lines read: {st['lines_read']} | parsed: {st['parsed']}"
+                + (f" ({st['parsed_flex_format']} via fallback format)" if st.get("parsed_flex_format") else "")
+                + f" | outside time window: {st['out_of_window']} | unparsed: {st['unparsed']}"
+            )
+            if st.get("log_ts_min"):
+                out.append(f"    Timestamps seen in log: {st['log_ts_min']} -> {st['log_ts_max']} UTC")
+            if st.get("parsed") and st.get("out_of_window") == st.get("parsed"):
+                out.append("    All parsed requests fall outside the requested window — widen the window")
+                out.append("    (e.g. --hour 24) or check the timestamp range above.")
+            filtered_out = res["requests_parsed_total"] - res["requests_after_filters"]
+            if res["requests_parsed_total"] and filtered_out == res["requests_parsed_total"]:
+                out.append(f"    All {filtered_out} in-window requests were excluded by the active filters ({filters_desc}).")
+            for s in st.get("unparsed_samples", []):
+                out.append(f"    Sample unparsed line: {s}")
+        elif res.get("access_log_files"):
+            out.append("    Access log file(s) contained no lines in the selected rotation slots.")
+        out.append("  Slow-log analysis below is independent and unaffected.")
     else:
         out.append("\n▸ Memory Overview")
         mr = mo["max_memory_request"]

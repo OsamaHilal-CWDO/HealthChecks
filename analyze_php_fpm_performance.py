@@ -577,6 +577,19 @@ def analyze_app(app, logs_dir, args, time_start, time_end, progress):
     slow_entries = parse_slow_logs(slow_files, time_start, time_end)
     total_parsed = len(requests)
 
+    last_activity = None
+    for f in access_files + [f for f, _ in access_skipped]:
+        try:
+            mt = f.stat().st_mtime
+        except OSError:
+            continue
+        if last_activity is None or mt > last_activity:
+            last_activity = mt
+    last_activity_s = (
+        datetime.fromtimestamp(last_activity, timezone.utc).strftime("%d/%b/%Y %H:%M")
+        if last_activity else None
+    )
+
     # Interactive filters (access-log analysis).
     methods = {m.strip().upper() for m in args.method.split(",") if m.strip()} if args.method else None
     types = {t.strip().lower() for t in args.request_type.split(",") if t.strip()} if args.request_type else None
@@ -616,6 +629,7 @@ def analyze_app(app, logs_dir, args, time_start, time_end, progress):
         "access_log_files_skipped": [f"{f.name}: {reason}" for f, reason in access_skipped],
         "slow_log_files": [f.name for f in slow_files],
         "slow_log_files_skipped": [f"{f.name}: {reason}" for f, reason in slow_skipped],
+        "access_log_last_activity": last_activity_s,
         "requests_parsed_total": total_parsed,
         "requests_after_filters": len(requests),
         "unparsed_lines": access_stats["unparsed"],
@@ -747,37 +761,26 @@ def render_app_report(res, filters_desc: str) -> list[str]:
     mo = res.get("memory_overview")
     if not mo:
         out.append("\n▸ Memory / Duration Profiling (php-app.access.log)")
-        out.append("  No usable requests in this window — memory profiling and avg/max duration")
-        out.append("  come from php-app.access.log. Diagnostics:")
         st = res.get("access_parse_stats", {})
-        if res.get("access_log_files_detail"):
-            out.append("    Access files read:  " + ", ".join(res["access_log_files_detail"]))
-        else:
-            out.append("    Access files read:  none")
-        if res.get("access_log_files_skipped"):
-            out.append("    Files skipped:      " + "; ".join(res["access_log_files_skipped"]))
-        if not res.get("access_log_files") and not res.get("access_log_files_skipped"):
-            out.append("    No php-app.access.log* files exist in this logs directory —")
-            out.append("    the FPM access log may be disabled for this app.")
-        if st.get("lines_read"):
+        have_files = bool(res.get("access_log_files") or res.get("access_log_files_skipped"))
+        filtered_out = res["requests_parsed_total"] - res["requests_after_filters"]
+        if not have_files:
+            out.append("  No php-app.access.log found for this app (FPM access log may be disabled).")
+        elif res["requests_parsed_total"] and filtered_out == res["requests_parsed_total"]:
             out.append(
-                f"    Lines read: {st['lines_read']} | parsed: {st['parsed']}"
-                + (f" ({st['parsed_flex_format']} via fallback format)" if st.get("parsed_flex_format") else "")
-                + f" | outside time window: {st['out_of_window']} | unparsed: {st['unparsed']}"
+                f"  No traffic matched: all {filtered_out} request(s) in this window were "
+                f"excluded by the active filters ({filters_desc})."
             )
-            if st.get("log_ts_min"):
-                out.append(f"    Timestamps seen in log: {st['log_ts_min']} -> {st['log_ts_max']} UTC")
-            if st.get("parsed") and st.get("out_of_window") == st.get("parsed"):
-                out.append("    All parsed requests fall outside the requested window — widen the window")
-                out.append("    (e.g. --hour 24) or check the timestamp range above.")
-            filtered_out = res["requests_parsed_total"] - res["requests_after_filters"]
-            if res["requests_parsed_total"] and filtered_out == res["requests_parsed_total"]:
-                out.append(f"    All {filtered_out} in-window requests were excluded by the active filters ({filters_desc}).")
+        elif st.get("unparsed") and not st.get("parsed"):
+            out.append(f"  {st['unparsed']} access-log line(s) did not match any known format.")
             for s in st.get("unparsed_samples", []):
-                out.append(f"    Sample unparsed line: {s}")
-        elif res.get("access_log_files"):
-            out.append("    Access log file(s) contained no lines in the selected rotation slots.")
-        out.append("  Slow-log analysis below is independent and unaffected.")
+                out.append(f"    Sample line: {s}")
+        else:
+            out.append("  No traffic observed during this time window.")
+            if st.get("log_ts_min"):
+                out.append(f"  (access-log activity spans {st['log_ts_min']} -> {st['log_ts_max']} UTC)")
+            elif res.get("access_log_last_activity"):
+                out.append(f"  (latest access-log activity: {res['access_log_last_activity']} UTC)")
     else:
         out.append("\n▸ Memory Overview")
         mr = mo["max_memory_request"]
